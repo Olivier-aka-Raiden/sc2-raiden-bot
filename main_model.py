@@ -1,7 +1,8 @@
+import json
 import math
 import time
 from enum import Enum
-import json
+
 import tensorflow as tf
 from typing import Dict, List, Set
 
@@ -72,7 +73,6 @@ def get_intersections(p0: Point2, r0: float, p1: Point2, r1: float) -> List[Poin
 
 
 class RaidenBot(BotAI):
-    json_data = None
 
     def __init__(self):
         self.opponent_name = None
@@ -134,26 +134,82 @@ class RaidenBot(BotAI):
         self.train_data = []
         self.flipped = []
         self.availableUnitsAbilities = {}
-        self.mineral_target_dict: Dict[Point2, Point2] = {}
+        self.use_model = True
         self.pathing: Pathing = None
+        self.selected_strategy_sequence = None
+        self.selected_strategy_key = None
+        self.mineral_target_dict: Dict[Point2, Point2] = {}
+        if self.use_model:
+            self.model = tf.keras.models.load_model("etc/BasicCNN-10-epochs-0.0001-LR-STAGE2")
 
     async def on_end(self, game_result):
-        logger.info('--- on_end called ---')
-        logger.info(game_result)
-        if game_result == Result.Victory:
-            np.save("train_data/{}.npy".format(str(int(time.time()))), np.array(self.train_data))
+        logger.info("--- on_end called ---")
+        # Load existing strategy data
+        strategy_data = {}
+        try:
+            with open("data/strategy.txt", "r") as f:
+                strategy_data = json.load(f)
+        except Exception as e:
+            print(f"An error occurred while reading the file: {e}")
+        print(strategy_data)
+        # Create or update strategy data for the opponent
+        opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        if opponent_key not in strategy_data:
+            strategy_data[opponent_key] = {
+                "strategies": {
+                    "000": {"ratio": 0.5, "games": 0},
+                    "001": {"ratio": 0.5, "games": 0},
+                    "010": {"ratio": 0.5, "games": 0},
+                    "011": {"ratio": 0.5, "games": 0},
+                    "100": {"ratio": 0.5, "games": 0},
+                    "101": {"ratio": 0.5, "games": 0},
+                    "111": {"ratio": 0.5, "games": 0}
+                },
+                "total_games": 0
+            }
+        # Update the strategy based on the game result
+        strategy = strategy_data[opponent_key]["strategies"][self.selected_strategy_key]
+        strategy["games"] += 1
+        # Update the total games played
+        strategy_data[opponent_key]["total_games"] += 1
+        # Calculate the new ratio based on game result and EWMA
+        alpha = 0.2 - (strategy["games"] / (strategy_data[opponent_key]["total_games"] * 10))  # Adjust this alpha value as needed
+        game_result_multiplier = 1 if game_result == Result.Victory else -1
+        current_ratio = strategy["ratio"]
+        new_ratio = current_ratio + alpha * (game_result_multiplier - current_ratio)
+
+        # Update the new ratio
+        strategy["ratio"] = new_ratio
+        try:
+            # Save updated strategy data
+            with open("data/strategy.txt", "w") as f:
+
+                json.dump(strategy_data, f, indent=4)
+                f.flush()
+        except Exception as e:
+            print(f"An error occurred while writing in the file: {e}")
+        with open("data/gameoutput-protoss.txt", "a") as f:
+            if self.use_model:
+                if game_result == Result.Victory:
+                    logger.info(f"Model Victory !\n")
+                    f.write(f"Model Victory !\n")
+                else:
+                    f.write(f"Model Defeat...\n")
+                    logger.info(f"Model Defeat...\n")
+            else:
+                if game_result == Result.Victory:
+                    f.write(f"raiden bot Victory !\n")
+                else:
+                    f.write(f"raiden bot Defeat...\n")
 
     async def on_step(self, iteration: int):
         self.iteration = iteration
-        if self.iteration == 10:
+        if self.iteration == 10 and self.opponent_name:
             await self.chat_send(f"gl, hf {self.opponent_name}!")
         if self.iteration == 1:
             self.greetings()
             self.calculate_locations()
             self.pathing = Pathing(self, False)
-            await self.init_json_data()
-        elif self.iteration % 50 == 49:
-            await self.update_json_data()
         self.calculate_targets()
         if self.enemy_race == Race.Terran and not (self.townhalls.ready.amount < 1 and self.units.of_type(UnitTypeId.PROBE).ready.amount < 1):
             await self.terran_opener()
@@ -202,71 +258,54 @@ class RaidenBot(BotAI):
         await self.idle_defense_behavior()
         await self.get_next_exp()
 
-    async def update_json_data(self):
-        self.json_data = {'ingame_time_in_minutes': int(self.iteration / self.ITERATIONS_PER_MINUTE), 'Player1': {}, 'Player2': {}}
-        self.json_data['Player1']['name'] = "Raiden"
-        self.json_data['Player1']['race'] = "Protoss"
-        self.json_data['Player1']['buildings'] = {}
-        self.json_data['Player1']['units'] = {}
-        if self.opponent_name:
-            self.json_data['Player2']['name'] = self.opponent_name
-        else:
-            self.json_data['Player2']['name'] = "TheBadGuy"
-        self.json_data['Player2']['race'] = self.enemy_race.name
-        self.json_data['Player2']['buildings'] = {}
-        self.json_data['Player2']['units'] = {}
-        self.json_data['Player1']['buildings'] = {}
-        self.json_data['Player1']['units'] = {}
-        for building in self.structures.ready:
-            if f"{building.name}" in self.json_data['Player1']['buildings']:
-                self.json_data['Player1']['buildings'][f"{building.name}"] += 1
-            else:
-                self.json_data['Player1']['buildings'][f"{building.name}"] = 1
-        for unit in self.units.ready:
-            if f"{unit.name}" in self.json_data['Player1']['units']:
-                self.json_data['Player1']['units'][f"{unit.name}"] += 1
-            else:
-                self.json_data['Player1']['units'][f"{unit.name}"] = 1
-        self.json_data['Player2']['buildings'] = {}
-        self.json_data['Player2']['units'] = {}
-        for building in self.enemy_structures.ready:
-            if f"{building.name}" in self.json_data['Player2']['buildings']:
-                self.json_data['Player2']['buildings'][f"{building.name}"] += 1
-            else:
-                self.json_data['Player2']['buildings'][f"{building.name}"] = 1
-        for unit in self.enemy_units.ready:
-            if f"{unit.name}" in self.json_data['Player2']['units']:
-                self.json_data['Player2']['units'][f"{unit.name}"] += 1
-            else:
-                self.json_data['Player2']['units'][f"{unit.name}"] = 1
-        with open("data/game_info.txt", "a") as f:
-            f.truncate(0)
-            f.write(json.dumps(self.json_data))
-
-    async def init_json_data(self):
-        self.json_data = {'Player1': {}, 'Player2': {}}
-        self.json_data['Player1']['name'] = "Raiden"
-        self.json_data['Player1']['race'] = "Protoss"
-        self.json_data['Player1']['buildings'] = {}
-        self.json_data['Player1']['units'] = {}
-        if self.opponent_name:
-            self.json_data['Player2']['name'] = self.opponent_name
-        else:
-            self.json_data['Player2']['name'] = "TheBadGuy"
-        self.json_data['Player2']['race'] = self.enemy_race.name
-        self.json_data['Player2']['buildings'] = {}
-        self.json_data['Player2']['units'] = {}
-        with open("data/game_info.txt", "a") as f:
-            f.truncate(0)
-            f.write(json.dumps(self.json_data))
-
     def greetings(self):
         with open('data/botnames.txt', 'r', encoding='utf8') as f:
-            if self.opponent_id is not None:
-                for line in f:
-                    parts = line.strip().split(' ')
-                    if parts[0] == self.opponent_id[0:8]:
-                        self.opponent_name = parts[1]
+            for line in f:
+                parts = line.strip().split(' ')
+                if parts[0] == self.opponent_id[0:8]:
+                    self.opponent_name = parts[1]
+            if not self.opponent_name:
+                self.opponent_name = "unidentified"
+        try:
+            with open("data/strategy.txt", "r") as f:
+                strategy_data = json.load(f)
+        except json.decoder.JSONDecodeError:
+            # Handle the case where the file is empty or not valid JSON
+            strategy_data = {}
+        # Create or update strategy data for the opponent
+        opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        if opponent_key not in strategy_data:
+            strategy_data[opponent_key] = {
+                "strategies": {
+                    "000": {"ratio": 0.5, "games": 0},
+                    "001": {"ratio": 0.5, "games": 0},
+                    "010": {"ratio": 0.5, "games": 0},
+                    "011": {"ratio": 0.5, "games": 0},
+                    "100": {"ratio": 0.5, "games": 0},
+                    "101": {"ratio": 0.5, "games": 0},
+                    "111": {"ratio": 0.5, "games": 0}
+                },
+                "total_games": 0
+            }
+        # Save updated strategy data
+
+        try:
+            with open("data/strategy.txt", "w") as f:
+                json.dump(strategy_data, f, indent=4)
+                f.flush()
+        except Exception as e:
+            print(f"An error occurred while writing in the file: {e}")
+        # Choose the strategy with the highest ratio
+        # Get the maximum ratio
+        max_ratio = max(strategy_data[opponent_key]["strategies"].values(), key=lambda strategy: strategy["ratio"])["ratio"]
+        # Create a list of strategy keys with the maximum ratio
+        max_ratio_strategy_keys = [key for key, strategy in strategy_data[opponent_key]["strategies"].items() if strategy["ratio"] == max_ratio]
+        # Select a random strategy key from the list
+        selected_strategy_key = random.choice(max_ratio_strategy_keys)
+        print(f"Strategy selected : {selected_strategy_key}, ratio : {strategy_data[opponent_key]['strategies'][selected_strategy_key]['ratio']}")
+        # Follow the sequence of the selected strategy
+        self.selected_strategy_sequence = [int(bit) for bit in selected_strategy_key]
+        self.selected_strategy_key = selected_strategy_key
 
     def calculate_locations(self):
         self.ordered_enemy_expands_locations = sorted(self.expansion_locations_list, key=lambda expansion: expansion.distance_to(self.enemy_start_locations[0]))
@@ -568,7 +607,7 @@ class RaidenBot(BotAI):
             if worker and \
                     (worker.distance_to(self.enemy_natural.position) > 26):
                 if self.structures(UnitTypeId.PYLON).ready.exists:
-                    pylon = self.structures(UnitTypeId.PYLON).ready.closest_to(worker)
+                    pylon = self.structures(UnitTypeId.PYLON).closest_to(self.ordered_enemy_expands_locations[0])
                     if pylon:
                         worker.move(pylon.position)
         if self.structures(UnitTypeId.PHOTONCANNON).ready.amount > 2 and self.proxy_pylon and self.proxy_ramp and (self.iteration - self.lastAttack) > 50:
@@ -705,7 +744,7 @@ class RaidenBot(BotAI):
             return
 
     async def protoss_photon_micro(self):
-        if self.iteration < 900 and self.enemy_units(UnitTypeId.PROBE).exists:
+        if self.iteration < 2000 and self.enemy_units(UnitTypeId.PROBE).exists:
             if self.enemy_structures.of_type({UnitTypeId.PYLON, UnitTypeId.PHOTONCANNON}).not_ready.exists:
                 proxy_enemy_structures = self.enemy_structures.of_type({UnitTypeId.PYLON, UnitTypeId.PHOTONCANNON}).not_ready.closer_than(50, self.start_location)
                 if proxy_enemy_structures.amount > 0:
@@ -1047,6 +1086,19 @@ class RaidenBot(BotAI):
                     scout(AbilityId.SMART, self.mineral_field.closest_to(self.ordered_enemy_expands_locations[1].position))
                     scout.move(self.enemy_natural.position.towards(self.game_info.map_center, 12), True)
                     self.lastAttack = self.iteration
+        """for player in self.game_info.players:
+            print(player.id)
+            print(player.name)
+            
+            if player.name.__contains__("QueenBot"):
+                closest_worker = workers.closest_to(position.Point2(position.Pointlike(self.enemy_start_locations[0])))
+                self.scout_tag = closest_worker.tag
+                #closest_worker.move(self.computeScoutLocation(1, self.enemy_start_locations[0]))
+                #closest_worker.move(self.computeScoutLocation(2, self.enemy_start_locations[0]), True)
+                #closest_worker.move(self.computeScoutLocation(3, self.enemy_start_locations[0]), True)
+                closest_worker.move(self.enemy_natural.position.towards(self.game_info.map_center, 15))
+                closest_worker(AbilityId.PATROL, position.Point2((self.enemy_natural.position.towards(self.game_info.map_center, 15)[0] + 1,
+                                                                 self.enemy_natural.position.towards(self.game_info.map_center, 15)[1] + 1)), True)"""
 
         if not self.scouted and self.scout_tag is None and self.ordered_enemy_expands_locations:
             self.scouted = True
@@ -1325,45 +1377,27 @@ class RaidenBot(BotAI):
                     self.pf_build = True
                     kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 6)
                     stalker.move(kite_location)
-
-                enemy = self.enemy_units.of_type({UnitTypeId.ZEALOT,
-                                                  UnitTypeId.PROBE,
-                                                  UnitTypeId.STALKER,
-                                                  UnitTypeId.IMMORTAL,
-                                                  UnitTypeId.VOIDRAY,
-                                                  UnitTypeId.ARCHON,
-                                                  UnitTypeId.ADEPT,
-                                                  UnitTypeId.SCV,
-                                                  UnitTypeId.MARINE,
-                                                  UnitTypeId.MARAUDER,
-                                                  UnitTypeId.GHOST,
-                                                  UnitTypeId.SIEGETANK,
-                                                  UnitTypeId.BATTLECRUISER,
-                                                  UnitTypeId.THOR,
-                                                  UnitTypeId.DRONE,
-                                                  UnitTypeId.ROACH,
-                                                  UnitTypeId.HYDRALISK,
-                                                  UnitTypeId.ULTRALISK,
-                                                  UnitTypeId.BANELING,
-                                                  UnitTypeId.MUTALISK}).closest_to(stalker) if self.enemy_units.of_type({UnitTypeId.ZEALOT,
-                                                                                                                         UnitTypeId.PROBE,
-                                                                                                                         UnitTypeId.STALKER,
-                                                                                                                         UnitTypeId.IMMORTAL,
-                                                                                                                         UnitTypeId.VOIDRAY,
-                                                                                                                         UnitTypeId.ARCHON,
-                                                                                                                         UnitTypeId.ADEPT,
-                                                                                                                         UnitTypeId.SCV,
-                                                                                                                         UnitTypeId.MARINE,
-                                                                                                                         UnitTypeId.MARAUDER,
-                                                                                                                         UnitTypeId.GHOST,
-                                                                                                                         UnitTypeId.SIEGETANK,
-                                                                                                                         UnitTypeId.THOR,
-                                                                                                                         UnitTypeId.DRONE,
-                                                                                                                         UnitTypeId.ROACH,
-                                                                                                                         UnitTypeId.HYDRALISK,
-                                                                                                                         UnitTypeId.ULTRALISK,
-                                                                                                                         UnitTypeId.BANELING,
-                                                                                                                         UnitTypeId.MUTALISK}).exists else None
+                offensive_unit_types = {UnitTypeId.ZEALOT,
+                                        UnitTypeId.PROBE,
+                                        UnitTypeId.STALKER,
+                                        UnitTypeId.IMMORTAL,
+                                        UnitTypeId.VOIDRAY,
+                                        UnitTypeId.ARCHON,
+                                        UnitTypeId.ADEPT,
+                                        UnitTypeId.SCV,
+                                        UnitTypeId.MARINE,
+                                        UnitTypeId.MARAUDER,
+                                        UnitTypeId.GHOST,
+                                        UnitTypeId.SIEGETANK,
+                                        UnitTypeId.BATTLECRUISER,
+                                        UnitTypeId.THOR,
+                                        UnitTypeId.DRONE,
+                                        UnitTypeId.ROACH,
+                                        UnitTypeId.HYDRALISK,
+                                        UnitTypeId.ULTRALISK,
+                                        UnitTypeId.BANELING,
+                                        UnitTypeId.MUTALISK}
+                enemy = self.enemy_units.of_type(offensive_unit_types).closest_to(stalker) if self.enemy_units.of_type(offensive_unit_types).exists else None
                 if enemy and (self.iteration - self.no_kiting_delay_map[stalker.tag]) > 20 and not ((enemy.type_id == UnitTypeId.PROBE or
                                                                                                      enemy.type_id == UnitTypeId.SCV or
                                                                                                      enemy.type_id == UnitTypeId.DRONE) and
@@ -1371,7 +1405,7 @@ class RaidenBot(BotAI):
                     if self.enemy_race == Race.Protoss:
                         if enemy.type_id == UnitTypeId.ZEALOT:
                             if enemy.distance_to(stalker) < 4 or (enemy.distance_to(stalker) < 6 and stalker.shield_percentage < 0.2) and \
-                                    stalker.distance_to(self.start_location) > 6 and \
+                                    stalker.distance_to(self.start_location) > 6 and self.townhalls.ready.exists and \
                                     not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
                                 kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
                                 second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
@@ -1391,7 +1425,7 @@ class RaidenBot(BotAI):
                                     self.no_kiting_delay_map[stalker.tag] = self.iteration
                                     stalker.move(self.main_base_ramp.top_center)
                         elif enemy.distance_to(stalker) < 6 or (enemy.distance_to(stalker) < 7 and stalker.shield_percentage < 0.2) and \
-                                stalker.distance_to(self.start_location) > 6 and \
+                                stalker.distance_to(self.start_location) > 6 and self.townhalls.ready.exists and \
                                 not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
                             if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 6:
                                 stalker.move(self.main_base_ramp.top_center)
@@ -1413,7 +1447,7 @@ class RaidenBot(BotAI):
                     if self.enemy_race == Race.Terran:
                         if enemy.distance_to(stalker) < 6 < stalker.distance_to(self.start_location) or \
                                 (enemy.distance_to(stalker) < 6 and stalker.shield_percentage < 0.2) and \
-                                not enemy.type_id == UnitTypeId.LIBERATOR and \
+                                not enemy.type_id == UnitTypeId.LIBERATOR and self.townhalls.ready.exists and \
                                 not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
                             if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 stalker.move(self.main_base_ramp.top_center)
@@ -1436,7 +1470,7 @@ class RaidenBot(BotAI):
                     if self.enemy_race == Race.Zerg:
                         if 1 < enemy.distance_to(stalker) < 7 and \
                                 stalker.distance_to(self.start_location) > 6 and \
-                                stalker.shield_percentage < 0.5 and \
+                                stalker.shield_percentage < 0.5 and self.townhalls.ready.exists and \
                                 not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
                             if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
@@ -1569,6 +1603,7 @@ class RaidenBot(BotAI):
                             abilities.__contains__(AbilityId.GUARDIANSHIELD_GUARDIANSHIELD) or \
                             abilities.__contains__(AbilityId.BEHAVIOR_PULSARBEAMON) or \
                             abilities.__contains__(AbilityId.BEHAVIOR_PULSARBEAMOFF) or \
+                            abilities.__contains__(AbilityId.ORACLEREVELATION_ORACLEREVELATION) or \
                             abilities.__contains__(AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT):
                         self.availableUnitsAbilities = await self.client.query_available_abilities_with_tag(
                             self.units.of_type({UnitTypeId.IMMORTAL,
@@ -1983,8 +2018,8 @@ class RaidenBot(BotAI):
                                 # return ActionResult.CantFindPlacementLocation
                                 logger.info("can't place")
                                 break
-                            if self.can_afford(UnitTypeId.ZEALOT) and self.units.of_type({UnitTypeId.STALKER, UnitTypeId.VOIDRAY}).amount > 10 and \
-                                    self.already_pending(UnitTypeId.VOIDRAY) > 4 and self.iteration > 2500:
+                            if self.can_afford(UnitTypeId.ZEALOT) and (self.units.of_type({UnitTypeId.STALKER, UnitTypeId.VOIDRAY}).amount > 10 or \
+                                                                       self.already_pending(UnitTypeId.VOIDRAY) > 4) and self.iteration > 2500:
                                 warpgate.warp_in(UnitTypeId.ZEALOT, placement)
             if self.armyComp == ArmyComp.GROUND:
                 cyberList = self.structures(UnitTypeId.CYBERNETICSCORE).ready
@@ -2048,12 +2083,12 @@ class RaidenBot(BotAI):
 
     async def handleHarass(self):
         if self.units.of_type({UnitTypeId.DARKTEMPLAR, UnitTypeId.ORACLE}).ready.exists:
-            oracles = self.units(UnitTypeId.ORACLE).ready
+            oracles = self.units(UnitTypeId.ORACLE).ready.idle
             if oracles:
                 for oracle in oracles:
                     if self.enemy_units.exists and self.enemy_units.of_type({UnitTypeId.PROBE, UnitTypeId.SCV, UnitTypeId.DRONE}).ready.amount > 0 and \
-                            self.enemy_units.of_type({UnitTypeId.PROBE, UnitTypeId.SCV, UnitTypeId.DRONE}).closer_than(8, oracle).exists:
-                        enemyWorkers = self.enemy_units.of_type({UnitTypeId.PROBE, UnitTypeId.SCV, UnitTypeId.DRONE}).closer_than(8, oracle)
+                            self.enemy_units.of_type({UnitTypeId.PROBE, UnitTypeId.SCV, UnitTypeId.DRONE}).closer_than(7, oracle).exists:
+                        enemyWorkers = self.enemy_units.of_type({UnitTypeId.PROBE, UnitTypeId.SCV, UnitTypeId.DRONE}).closer_than(7, oracle)
                         if oracle.tag in self.availableUnitsAbilities.keys():
                             if AbilityId.BEHAVIOR_PULSARBEAMON in self.availableUnitsAbilities.get(oracle.tag, set()):
                                 oracle(AbilityId.BEHAVIOR_PULSARBEAMON)
@@ -2178,6 +2213,17 @@ class RaidenBot(BotAI):
             return
 
     async def probeEscape(self):
+        offensive_units = {UnitTypeId.ZEALOT,
+                           UnitTypeId.ZERGLING,
+                           UnitTypeId.ROACH,
+                           UnitTypeId.STALKER,
+                           UnitTypeId.IMMORTAL,
+                           UnitTypeId.HYDRALISK,
+                           UnitTypeId.ADEPT,
+                           UnitTypeId.DARKTEMPLAR,
+                           UnitTypeId.SENTRY,
+                           UnitTypeId.MARAUDER,
+                           UnitTypeId.MARINE}
         if self.rushDetected is True:
             if self.enemy_units.of_type({UnitTypeId.ZERGLING, UnitTypeId.ROACH}).exists:
                 for probe in self.units(UnitTypeId.PROBE).ready:
@@ -2185,10 +2231,10 @@ class RaidenBot(BotAI):
                         enemy_units = self.enemy_units.of_type({UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.ROACH, UnitTypeId.LURKER}).closer_than(5, probe)
                         if enemy_units and not probe.is_attacking:
                             probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
-        if self.enemy_units.of_type({UnitTypeId.ZEALOT, UnitTypeId.ZERGLING, UnitTypeId.ROACH}).exists:
+        if self.enemy_units.of_type(offensive_units).exists:
             for probe in self.units(UnitTypeId.PROBE).ready:
                 if probe.distance_to(self.start_location) > 9:
-                    enemy_units = self.enemy_units.of_type({UnitTypeId.ZEALOT, UnitTypeId.ZERGLING, UnitTypeId.ROACH}).closer_than(4, probe)
+                    enemy_units = self.enemy_units.of_type(offensive_units).closer_than(4, probe)
                     if enemy_units and not probe.is_attacking:
                         probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
 
@@ -2200,7 +2246,7 @@ class RaidenBot(BotAI):
                             self.lastAttack = self.iteration
                             return
                 for probe in self.units(UnitTypeId.PROBE):
-                    if probe.is_attacking:
+                    if probe.is_attacking or probe.is_idle:
                         probe(AbilityId.SMART, self.mineral_field.closest_to(self.townhalls.ready.closest_to(probe)))
             elif nexus.shield_percentage < 0.5 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.closer_than(10, nexus):
                 self.lastAttack = self.iteration
@@ -2212,21 +2258,26 @@ class RaidenBot(BotAI):
                             break
                     except:
                         return
-            elif self.iteration < 2000 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.exists and \
-                    0 < self.enemy_units.closer_than(9, nexus).of_type({UnitTypeId.ZEALOT,
-                                                                        UnitTypeId.STALKER,
-                                                                        UnitTypeId.ADEPT,
-                                                                        UnitTypeId.ZERGLING,
-                                                                        UnitTypeId.SENTRY,
-                                                                        UnitTypeId.MARINE,
-                                                                        UnitTypeId.MARAUDER}).amount < 8 and \
-                    0 < self.enemy_units.closer_than(7, nexus).of_type({UnitTypeId.ZEALOT,
-                                                                        UnitTypeId.STALKER,
-                                                                        UnitTypeId.ADEPT,
-                                                                        UnitTypeId.ZERGLING,
-                                                                        UnitTypeId.SENTRY,
-                                                                        UnitTypeId.MARINE,
-                                                                        UnitTypeId.MARAUDER}).amount:
+            elif nexus.distance_to(self.start_location) < 4 \
+                    and (self.iteration - self.lastAttack) > 50 and \
+                    self.enemy_units.of_type(offensive_units).exists and \
+                    self.enemy_units.of_type(offensive_units).closer_than(8, nexus) and \
+                    0 < self.enemy_units.closer_than(8, nexus).of_type(offensive_units).amount < 5:
+                self.lastAttack = self.iteration
+                self.attacked_nexus = nexus.tag
+                for probe in self.units(UnitTypeId.PROBE).closer_than(7, nexus):
+                    try:
+                        if self.enemy_units.exists:
+                            probe.attack(self.enemy_units.closest_to(nexus).position)
+                            break
+                    except:
+                        return
+            elif self.iteration < 2000 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.exists and (
+                    6 < self.enemy_units.closer_than(10, nexus).of_type({UnitTypeId.DRONE,
+                                                                         UnitTypeId.PROBE,
+                                                                         UnitTypeId.SCV}).amount or (
+                            0 < self.enemy_units.closer_than(10, nexus).of_type(offensive_units).amount < 8 and
+                            0 < self.enemy_units.closer_than(7, nexus).of_type(offensive_units).amount)):
                 self.lastAttack = self.iteration
                 self.attacked_nexus = nexus.tag
                 total_probes = self.units(UnitTypeId.PROBE).ready.amount
@@ -2238,13 +2289,13 @@ class RaidenBot(BotAI):
                         probe.attack(self.enemy_units.closest_to(nexus).position)
                 break
             elif self.iteration < 2000 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.exists and \
-                    self.enemy_units.closer_than(9, nexus).amount > 7:
+                    self.enemy_units.closer_than(10, nexus).amount > 7:
                 self.lastAttack = self.iteration
                 if not self.attacked_nexus or nexus.tag == self.attacked_nexus:
                     self.attacked_nexus = None
                     for probe in self.units(UnitTypeId.PROBE).closer_than(10, nexus):
                         try:
-                            if self.townhalls.ready.exists:
+                            if self.townhalls.ready.exists and probe.distance_to(self.start_location) > 9:
                                 probe.move(self.townhalls.closest_to(self.start_location).position)
                                 probe(AbilityId.SMART, self.mineral_field.closest_to(self.townhalls.closest_to(self.start_location)), True)
                                 break
@@ -2315,13 +2366,27 @@ class RaidenBot(BotAI):
                     u.attack(squadLeader.position)
 
     async def attack(self):
+        choice_dict = {0: "No Attack!",
+                       1: "Attack close to our nexus !",
+                       2: "Attack Enemy Structure !",
+                       3: "Attack Enemy Start !",
+                       4: "Attack specific target in vision !"}
         attackedNexus = None
+        build_choices_made = 0
+        if self.iteration < 100:
+            return
         # Choices for build orders (can change only after 3000 iterations)
         if not self.armyComp or (self.iteration - self.lastBuildChoice) > 3000:
-            self.lastBuildChoice = self.iteration
-            buildChoice = random.randrange(0, 2)
-            self.armyComp = ArmyComp.GROUND if buildChoice == ArmyComp.GROUND.value else ArmyComp.AIR
-            self.mainUnit = UnitTypeId.STALKER if self.armyComp == ArmyComp.GROUND else UnitTypeId.VOIDRAY
+            if self.selected_strategy_sequence and build_choices_made < 3:
+                self.lastBuildChoice = self.iteration
+                self.armyComp = ArmyComp.GROUND if self.selected_strategy_sequence[build_choices_made] == ArmyComp.GROUND.value else ArmyComp.AIR
+                self.mainUnit = UnitTypeId.STALKER if self.armyComp == ArmyComp.GROUND else UnitTypeId.VOIDRAY
+                build_choices_made += 1
+            else:
+                self.lastBuildChoice = self.iteration
+                buildChoice = random.randrange(0, 2)
+                self.armyComp = ArmyComp.GROUND if buildChoice == ArmyComp.GROUND.value else ArmyComp.AIR
+                self.mainUnit = UnitTypeId.STALKER if self.armyComp == ArmyComp.GROUND else UnitTypeId.VOIDRAY
 
         if self.armyComp == ArmyComp.AIR:
             self.mainUnit = UnitTypeId.VOIDRAY
@@ -2329,23 +2394,24 @@ class RaidenBot(BotAI):
             self.mainUnit = UnitTypeId.STALKER
         else:
             self.mainUnit = UnitTypeId.VOIDRAY
-        # Choices for attacks
         if self.units.of_type({UnitTypeId.STALKER, UnitTypeId.VOIDRAY}).idle.amount > 0 and self.units(UnitTypeId.IMMORTAL).idle.amount >= 0:
-            for nexus in self.townhalls.ready:
-                if nexus.shield_percentage < 0.6 and self.enemy_units.closer_than(8, nexus):
-                    attackedNexus = nexus
-            choice = random.randrange(0, 5)
-            if self.defensiveBehavior:
+            if self.iteration > self.do_something_after:
                 for nexus in self.townhalls.ready:
                     if nexus.shield_percentage < 0.6 and self.enemy_units.closer_than(8, nexus):
                         attackedNexus = nexus
-                        choice = 1
-                if choice == 3 or choice == 2 or choice == 4:
-                    choice = 1
+                if self.use_model:
+                    resized_image = cv.resize(self.flipped, (168, 168))
+                    pad_with = ((0, 0), (0, 24), (0, 0))
+                    padded_image = np.pad(resized_image, pad_with, mode='constant')
+                    prediction = self.model.predict([padded_image.reshape([-1, 168, 192, 3])])
+                    choice = np.argmax(prediction[0])
+                    # print('prediction: ',choice)
+                    logger.info("Choice #{}:{}".format(choice, choice_dict[choice]))
+                else:
+                    choice = random.randrange(0, 5)
 
-            target = False
-
-            if self.iteration > self.do_something_after:
+                target = False
+                logger.info(f"Resolved Choice #{choice}:{choice_dict[choice]}")
                 if choice == 0:
                     # no attack
                     self.manageArmy()
@@ -2421,17 +2487,17 @@ def main():
         run_multiple_games(
             [
                 GameMatch(
-                    maps.get("RoyalBloodAIE"), [
+                    maps.get("GresvanAIE"), [
                         Bot(Race.Protoss, RaidenBot()),
-                        Computer(Race.Terran, Difficulty.Harder)], realtime=True),
+                        Computer(Race.Terran, Difficulty.Harder, ai_build=AIBuild.Rush)], realtime=True),
                 GameMatch(
                     maps.get("StargazersAIE"), [
                         Bot(Race.Protoss, RaidenBot()),
-                        Computer(Race.Terran, Difficulty.Harder)], realtime=True),
+                        Computer(Race.Zerg, Difficulty.Harder, ai_build=AIBuild.Rush)], realtime=True),
                 GameMatch(
                     maps.get("GresvanLE"), [
                         Bot(Race.Protoss, RaidenBot()),
-                        Computer(Race.Terran, Difficulty.Harder)], realtime=True)
+                        Computer(Race.Zerg, Difficulty.Harder, ai_build=AIBuild.Rush)], realtime=True)
             ]
         )
 
