@@ -12,6 +12,40 @@ ATTACK_TARGET_IGNORE: Set[UnitTypeId] = {
     UnitTypeId.CHANGELINGZERGLINGWINGS,
 }
 
+ALLY_FIGHTING_UNITS: Set[UnitTypeId] = {
+    UnitTypeId.VOIDRAY,
+    UnitTypeId.IMMORTAL,
+    UnitTypeId.STALKER,
+    UnitTypeId.SENTRY,
+    UnitTypeId.ARCHON,
+    UnitTypeId.HIGHTEMPLAR,
+    UnitTypeId.ZEALOT,
+    UnitTypeId.COLOSSUS,
+}
+
+AA_ENEMY_UNITS: Set[UnitTypeId] = {
+    UnitTypeId.VOIDRAY,
+    UnitTypeId.CARRIER,
+    UnitTypeId.CORRUPTOR,
+    UnitTypeId.HYDRALISK,
+    UnitTypeId.VIKING,
+    UnitTypeId.MARINE,
+    UnitTypeId.GHOST,
+    UnitTypeId.THOR,
+    UnitTypeId.STALKER,
+    UnitTypeId.CYCLONE,
+    UnitTypeId.QUEEN,
+    UnitTypeId.ARCHON,
+    UnitTypeId.MUTALISK,
+    UnitTypeId.AUTOTURRET
+}
+
+ENEMY_TRAP_UNITS: Set[UnitTypeId] = {
+    UnitTypeId.WIDOWMINEBURROWED,
+    UnitTypeId.LURKERMPBURROWED,
+    UnitTypeId.BANELINGBURROWED,
+}
+
 ALL_STRUCTURES: Set[UnitTypeId] = {
     UnitTypeId.ARMORY,
     UnitTypeId.ASSIMILATOR,

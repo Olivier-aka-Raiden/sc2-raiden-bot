@@ -17,7 +17,7 @@ from sc2.ids.unit_typeid import *
 from sc2.ids.upgrade_id import *
 from sc2.ids.ability_id import *
 from sc2.ids.buff_id import *
-from consts import ALL_STRUCTURES, ATTACK_TARGET_IGNORE
+from consts import ALLY_FIGHTING_UNITS, ATTACK_TARGET_IGNORE, ENEMY_TRAP_UNITS, AA_ENEMY_UNITS
 import random
 import cv2 as cv
 import numpy as np
@@ -32,7 +32,6 @@ from pathing import Pathing
 
 MINING_RADIUS = 1.325
 HEADLESS = True
-
 
 class ArmyComp(Enum):
     GROUND = 0
@@ -75,6 +74,12 @@ def get_intersections(p0: Point2, r0: float, p1: Point2, r1: float) -> List[Poin
 class RaidenBot(BotAI):
 
     def __init__(self):
+        self.last_micro_management = 0
+        self.current_target = {}
+        self.probe_assigned_to_gas = set()
+        self.availableStructuresAbilities = None
+        self.structures_abilities = None
+        self.scout_last_move = 0
         self.opponent_name = None
         self.build_timing = 0
         self.last_highground_pylon_timing = 0
@@ -129,16 +134,21 @@ class RaidenBot(BotAI):
         self.forgeWallPos = None
         self.walled = False
         self.builder_tag = None
+        self.last_photon_builder_action = 0
+        self.builder_perform_action = 0
         self.zealot_move_to_wall = 0
         self.units_abilities = []
         self.train_data = []
         self.flipped = []
         self.availableUnitsAbilities = {}
+        self.assimilatorTypes = {UnitTypeId.ASSIMILATOR, UnitTypeId.ASSIMILATORRICH}
         self.use_model = True
         self.pathing: Pathing = None
         self.selected_strategy_sequence = None
         self.selected_strategy_key = None
+        self.build_choices_made = 0
         self.mineral_target_dict: Dict[Point2, Point2] = {}
+        self.voidray_last_attack_move = {}
         if self.use_model:
             self.model = tf.keras.models.load_model("etc/BasicCNN-10-epochs-0.0001-LR-STAGE2")
 
@@ -153,7 +163,10 @@ class RaidenBot(BotAI):
             print(f"An error occurred while reading the file: {e}")
         print(strategy_data)
         # Create or update strategy data for the opponent
-        opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        if self.opponent_id:
+            opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        else:
+            opponent_key = "test_local"
         if opponent_key not in strategy_data:
             strategy_data[opponent_key] = {
                 "strategies": {
@@ -177,7 +190,8 @@ class RaidenBot(BotAI):
         game_result_multiplier = 1 if game_result == Result.Victory else -1
         current_ratio = strategy["ratio"]
         new_ratio = current_ratio + alpha * (game_result_multiplier - current_ratio)
-
+        # Clamp the new_ratio to ensure it doesn't go below 0
+        new_ratio = max(new_ratio, 0.0)
         # Update the new ratio
         strategy["ratio"] = new_ratio
         try:
@@ -245,6 +259,7 @@ class RaidenBot(BotAI):
         await self.computeTradeEfficiency()
         await self.followingObserver()
         await self.handleBlink()
+        await self.handleBatteryOverchage()
         await self.handleHighTemplar()
         await self.manageChronoboost()
         await self.handleSentry()
@@ -262,7 +277,7 @@ class RaidenBot(BotAI):
         with open('data/botnames.txt', 'r', encoding='utf8') as f:
             for line in f:
                 parts = line.strip().split(' ')
-                if parts[0] == self.opponent_id[0:8]:
+                if self.opponent_id and parts[0] == self.opponent_id[0:8]:
                     self.opponent_name = parts[1]
             if not self.opponent_name:
                 self.opponent_name = "unidentified"
@@ -273,7 +288,10 @@ class RaidenBot(BotAI):
             # Handle the case where the file is empty or not valid JSON
             strategy_data = {}
         # Create or update strategy data for the opponent
-        opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        if self.opponent_id:
+            opponent_key = f"{self.opponent_id[:8]}_{self.opponent_name}"
+        else:
+            opponent_key = "test_local"
         if opponent_key not in strategy_data:
             strategy_data[opponent_key] = {
                 "strategies": {
@@ -318,7 +336,7 @@ class RaidenBot(BotAI):
             self.enemy_natural = natural1
         else:
             self.enemy_natural = natural2
-        self.proxy_pos = self.enemy_natural.position.towards(self.start_location, 17)
+        self.proxy_pos = self.find_pathable_position(self.enemy_natural, 17)
         for ramp in sortedRamps:
             if ramp.bottom_center.distance_to(self.proxy_pos) < 7:
                 self.proxy_ramp = ramp
@@ -354,6 +372,9 @@ class RaidenBot(BotAI):
             if attack_unit.distance_to(self.enemy_start_locations[0]) < 3:
                 main_base_destroyed = True
         if main_base_destroyed:
+            nexus_list = self.townhalls
+            enemy_expands_copy = self.ordered_enemy_expands_locations[:]
+            enemy_expands_copy = [expand for expand in enemy_expands_copy if not any(nexus.distance_to(expand) < 10 for nexus in nexus_list)]
             for attack_unit in self.units.of_type({UnitTypeId.IMMORTAL,
                                                    UnitTypeId.VOIDRAY,
                                                    UnitTypeId.STALKER,
@@ -361,13 +382,12 @@ class RaidenBot(BotAI):
                                                    UnitTypeId.ORACLE,
                                                    UnitTypeId.HIGHTEMPLAR}).ready:
                 if not attack_unit.tag in self.cleared_all_expansion_map:
-                    for i in range(len(self.ordered_enemy_expands_locations) - 1):
-                        if i < 3:
-                            continue
-                        if i == 3:
-                            attack_unit.attack(self.ordered_enemy_expands_locations[i])
-                        elif self.ordered_enemy_expands_locations[i].distance_to(self.start_location) > 25:
-                            attack_unit.attack(self.ordered_enemy_expands_locations[i], True)
+                    first = True
+                    for expand in enemy_expands_copy:
+                        if first:
+                            first = False
+                            attack_unit.attack(expand)
+                        attack_unit.attack(expand, True)
                     self.cleared_all_expansion_map[attack_unit.tag] = True
         if self.iteration > 5000 and 0 < self.enemy_structures.amount < 4:
             for structure in self.enemy_structures:
@@ -387,7 +407,7 @@ class RaidenBot(BotAI):
         if self.enemy_race == Race.Zerg:
             if self.iteration > 1500 and self.structures.not_ready.exists:
                 for structure in self.structures.not_ready:
-                    if structure.distance_to(self.main_base_ramp.top_center) < 7 and not structure.type_id == UnitTypeId.PHOTONCANNON:
+                    if (self.iteration - self.builder_perform_action) > 400 and structure.distance_to(self.main_base_ramp.top_center) < 7 and not structure.type_id == UnitTypeId.PHOTONCANNON:
                         structure(AbilityId.CANCEL_BUILDINPROGRESS)
             if self.zealot_tag is not None:
                 if not self.units.find_by_tag(self.zealot_tag):
@@ -442,7 +462,7 @@ class RaidenBot(BotAI):
                 return
             else:
                 worker.move(self.forgeWallPos)
-        if not self.structures(UnitTypeId.FORGE).ready.exists and \
+        if self.iteration < 1000 and not self.structures(UnitTypeId.FORGE).ready.exists and \
                 self.can_afford(UnitTypeId.FORGE) and not self.already_pending(UnitTypeId.FORGE) > 0:
             self.forgeWallPos = tuple(self.main_base_ramp.protoss_wall_buildings)[1]
             worker = self.units.find_by_tag(self.builder_tag)
@@ -450,7 +470,30 @@ class RaidenBot(BotAI):
                 return
             else:
                 worker.build(UnitTypeId.FORGE, self.forgeWallPos)
+                self.builder_perform_action = self.iteration
             return
+
+    def find_pathable_position(self, target, distance):
+        test_limit = 10
+        iteration = 0
+        max_difference = math.pi / 4
+        target_position = position.Point2(target.position.towards(self.start_location, distance))
+        # Check if the target position is pathable, and if not, find a nearby pathable position
+        is_build_possible = True
+        for pos in target_position.neighbors4:
+            if not self.in_pathing_grid(pos):
+                is_build_possible = False
+        while not is_build_possible and iteration < test_limit:
+            iteration += 1
+            new_position = position.Point2(target.position.towards_with_random_angle(self.start_location, distance, max_difference))
+            is_build_possible = True
+            for pos in new_position.neighbors4:
+                if not self.in_pathing_grid(pos):
+                    is_build_possible = False
+            if is_build_possible:
+                return new_position
+
+        return target_position
 
     async def wall_build_order(self):
         """if self.iteration < 500 and self.enemy_units(UnitTypeId.DRONE).exists:
@@ -500,13 +543,13 @@ class RaidenBot(BotAI):
                 return
         if self.roach_rush:
             if self.structures.of_type({UnitTypeId.NEXUS, UnitTypeId.ROBOTICSFACILITY}).not_ready.exists:
-                for structure in self.structures.of_type({UnitTypeId.NEXUS, UnitTypeId.ROBOTICSFACILITY}).not_ready:
+                for structure in self.structures.of_type({UnitTypeId.NEXUS}).not_ready:
                     structure(AbilityId.CANCEL_BUILDINPROGRESS)
             if self.enemy_units.of_type(UnitTypeId.ROACH).exists:
                 roachs = self.enemy_units.of_type(UnitTypeId.ROACH)
                 if roachs and roachs.closest_distance_to(self.start_location) < 17:
                     for probe in self.units(UnitTypeId.PROBE).ready:
-                        if roachs.closest_distance_to(probe) < 1:
+                        if roachs.closest_distance_to(probe) < 2:
                             probe.attack(self.start_location)
                             self.lastAttack = self.iteration
                         else:
@@ -515,10 +558,14 @@ class RaidenBot(BotAI):
                 elif roachs.closest_distance_to(self.start_location) > 30 and (self.iteration - self.lastAttack) > 80:
                     self.roach_rush = False
                     for probe in self.units(UnitTypeId.PROBE).ready:
-                        if probe.is_attacking:
+                        if probe.is_attacking or probe.distance_to(self.start_location) > 10:
                             probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
-            elif self.iteration > 1400 and (self.iteration - self.lastAttack) > 80:
+            elif self.lastAttack != 0 and (self.iteration - self.lastAttack) > 80:
                 self.roach_rush = False
+                for probe in self.units(UnitTypeId.PROBE).ready:
+                    if probe.distance_to(self.start_location) > 10:
+                        probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
+
         if self.townhalls.ready.amount > 1 and self.builder_tag and (self.rushDetected is False or self.iteration > 1200):
             worker = self.units.find_by_tag(self.builder_tag)
             if worker:
@@ -539,22 +586,25 @@ class RaidenBot(BotAI):
                 self.builder_tag = worker.tag
                 self.pylonAtRamp = True
                 return
-        if not self.structures(UnitTypeId.FORGE).ready.exists and \
+        if not self.structures(UnitTypeId.FORGE).ready.exists and self.builder_tag is not None and \
                 self.can_afford(UnitTypeId.FORGE) and not self.already_pending(UnitTypeId.FORGE) > 0:
             self.forgeWallPos = tuple(self.main_base_ramp.protoss_wall_buildings)[1]
             self.gatewayWallPos = tuple(self.main_base_ramp.protoss_wall_buildings)[0]
             worker = self.units.find_by_tag(self.builder_tag)
-            if not worker:
-                return
-            else:
+            if not worker and self.units(UnitTypeId.PROBE).ready.exists:
+                workers = self.units(UnitTypeId.PROBE).filter(lambda unit: unit.tag != self.scout_tag)
+                if workers.amount > 0:
+                    worker = workers.closest_to(self.main_base_ramp.protoss_wall_pylon)
+            if worker:
                 worker.build(UnitTypeId.FORGE, self.forgeWallPos)
                 worker.move(tuple(self.main_base_ramp.protoss_wall_buildings)[0], True)
                 worker(AbilityId.PATROL,
                        position.Point2((tuple(self.main_base_ramp.protoss_wall_buildings)[0][0] + 1,
                                         tuple(self.main_base_ramp.protoss_wall_buildings)[0][1] + 1)), True)
+                self.builder_perform_action = self.iteration
             return
         if self.structures(UnitTypeId.FORGE).exists and not self.structures.of_type({UnitTypeId.GATEWAY, UnitTypeId.WARPGATE}).ready.exists and \
-                self.can_afford(UnitTypeId.GATEWAY) and not self.already_pending(UnitTypeId.GATEWAY) > 0:
+                self.can_afford(UnitTypeId.GATEWAY) and not self.already_pending(UnitTypeId.GATEWAY) > 0 and self.builder_tag is not None:
             self.gatewayWallPos = tuple(self.main_base_ramp.protoss_wall_buildings)[0]
             worker = self.units.find_by_tag(self.builder_tag)
             if not worker and self.units(UnitTypeId.PROBE).ready.exists:
@@ -567,10 +617,11 @@ class RaidenBot(BotAI):
                 worker(AbilityId.PATROL,
                        position.Point2((tuple(self.main_base_ramp.protoss_wall_buildings)[1][0] + 3,
                                         tuple(self.main_base_ramp.protoss_wall_buildings)[1][1] + 3)), True)
+                self.builder_perform_action = self.iteration
             return
 
         if self.rushDetected is True and not self.structures(UnitTypeId.PHOTONCANNON).ready.exists and self.structures(UnitTypeId.FORGE).ready.exists and \
-                self.can_afford(UnitTypeId.PHOTONCANNON) and not self.already_pending(UnitTypeId.PHOTONCANNON) > 0:
+                self.can_afford(UnitTypeId.PHOTONCANNON) and not self.already_pending(UnitTypeId.PHOTONCANNON) > 0 and self.builder_tag is not None:
             worker = self.units.find_by_tag(self.builder_tag)
             if not worker and self.units(UnitTypeId.PROBE).ready.exists:
                 workers = self.units(UnitTypeId.PROBE).filter(lambda unit: unit.tag != self.scout_tag)
@@ -583,7 +634,7 @@ class RaidenBot(BotAI):
                 return
         if self.rushDetected is True and self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists and self.structures(UnitTypeId.FORGE).ready.exists and \
                 self.can_afford(UnitTypeId.SHIELDBATTERY) and not self.already_pending(UnitTypeId.SHIELDBATTERY) > 0 and \
-                not self.structures(UnitTypeId.SHIELDBATTERY).exists:
+                not self.structures(UnitTypeId.SHIELDBATTERY).exists and self.builder_tag is not None:
             worker = self.units.find_by_tag(self.builder_tag)
             if not worker and self.units(UnitTypeId.PROBE).ready.exists:
                 workers = self.units(UnitTypeId.PROBE).filter(lambda unit: unit.tag != self.scout_tag)
@@ -594,7 +645,7 @@ class RaidenBot(BotAI):
                 worker.build(UnitTypeId.SHIELDBATTERY, position.Point2(self.main_base_ramp.top_center.towards(self.forgeWallPos, 5)), True)
                 self.builder_tag = None
                 return
-        if self.already_pending(UnitTypeId.GATEWAY) > 0 and self.builder_tag:
+        if self.structures(UnitTypeId.GATEWAY).ready.amount > 0 and self.builder_tag is not None:
             worker = self.units.find_by_tag(self.builder_tag)
             if not worker:
                 return
@@ -604,7 +655,7 @@ class RaidenBot(BotAI):
                 return
         if self.scouted and self.scout_tag and self.proxy_pylon:
             worker = self.units.find_by_tag(self.scout_tag)
-            if worker and \
+            if worker and self.structures(UnitTypeId.PYLON).ready.closer_than(40, self.enemy_main_base_ramp.bottom_center).exists and \
                     (worker.distance_to(self.enemy_natural.position) > 26):
                 if self.structures(UnitTypeId.PYLON).ready.exists:
                     pylon = self.structures(UnitTypeId.PYLON).closest_to(self.ordered_enemy_expands_locations[0])
@@ -840,6 +891,53 @@ class RaidenBot(BotAI):
             self.game_info.map_center, self.pathing.ground_grid
         )
 
+    async def handle_attacking_unit_safety(self, unit: Unit, attack_target: Point2) -> None:
+        grid: np.ndarray = self.pathing.ground_grid
+        # pull back low health probe to heal
+        if unit.shield_percentage < 0.2:
+            unit.move(
+                self.pathing.find_path_next_point(
+                    unit.position, self.get_heal_spot, grid
+                )
+            )
+            return
+
+        close_enemies: Units = self.enemy_units.filter(
+            lambda u: u.position.distance_to(unit) < 7
+                      and not u.is_flying
+                      and unit.type_id in ENEMY_TRAP_UNITS
+        )
+
+        # no target and in danger, run away
+        if close_enemies and close_enemies.amount > 0 and not self.pathing.is_position_safe(grid, unit.position):
+            self.move_to_safety(unit, grid)
+            return
+
+        # get to the target
+        if unit.distance_to(attack_target) > 12:
+            # only make pathing queries if enemies are close
+            if close_enemies:
+                unit.move(
+                    self.pathing.find_path_next_point(
+                        unit.position, attack_target, grid
+                    )
+                )
+            else:
+                # Retrieve the unit object using its tag
+                order_target = self.units.find_by_tag(unit.order_target) if isinstance(unit.order_target, int) else unit.order_target
+
+                if order_target and order_target.position.distance_to(attack_target) > 1:
+                    unit.attack(attack_target)
+                else:
+                    unit.attack(attack_target)
+        elif isinstance(unit.order_target, int):
+            # If order_target is a unit tag, find the unit object and check distance
+            order_target = self.units.find_by_tag(unit.order_target)
+            if order_target and order_target.position.distance_to(attack_target) > 1:
+                unit.attack(attack_target)
+        elif unit.order_target.position.distance_to(attack_target) > 1:
+            unit.attack(attack_target)
+
     async def handle_unit_safety(self, unit: Unit, attack_target: Point2) -> None:
         grid: np.ndarray = self.pathing.ground_grid
         # pull back low health probe to heal
@@ -907,12 +1005,14 @@ class RaidenBot(BotAI):
                     self.scouted = True
                     scout.move(self.enemy_natural.position)
                     scout(AbilityId.PATROL, self.enemy_natural.position.towards(self.enemy_main_base_ramp.bottom_center, 2), True)
-                if self.scouted and self.scout_tag and self.proxy_pylon and \
+                if (self.iteration - self.last_photon_builder_action) > 30 and (self.iteration - self.scout_last_move) > 30 and self.scouted and self.scout_tag and self.proxy_pylon and \
                         (scout.distance_to(self.enemy_natural.position) > 18 and scout.distance_to(self.mineral_field.closest_to(scout)) < 2):
                     scout.move(self.enemy_natural)
-                if self.iteration > 300 and self.scouted and self.scout_tag and scout.distance_to(self.enemy_natural) > 22:
+                    self.scout_last_move = self.iteration
+                if (self.iteration - self.last_photon_builder_action) > 30 and (self.iteration - self.scout_last_move) > 30 and self.iteration > 300 and self.scouted and self.scout_tag and scout.distance_to(self.enemy_natural) > 22:
                     scout(AbilityId.SMART, self.mineral_field.closest_to(self.enemy_natural.position))
-                if self.scouted and self.scout_tag and scout.shield_percentage < 0.9:
+                    self.scout_last_move = self.iteration
+                if (self.iteration - self.last_photon_builder_action) > 30 and (self.iteration - self.scout_last_move) > 30 and self.proxy_pylon and self.scouted and self.scout_tag and scout.shield_percentage < 0.9:
                     await self.handle_unit_safety(scout, self.enemy_main_base_ramp.top_center)
 
                 if scout.distance_to(self.enemy_natural) < 6 and \
@@ -929,6 +1029,7 @@ class RaidenBot(BotAI):
                     scout.move(self.enemy_natural.position, True)
                     scout(AbilityId.PATROL, self.enemy_natural.position.towards(self.enemy_main_base_ramp.bottom_center, 2), True)
                     self.proxy_pylon = True
+                    self.last_photon_builder_action = self.iteration
                 if self.proxy_pylon and self.structures(UnitTypeId.PYLON).exists:
                     if self.structures(UnitTypeId.PYLON).ready.closer_than(30, scout).amount > 1:
                         self.second_proxy = True
@@ -941,7 +1042,7 @@ class RaidenBot(BotAI):
                         scout.move(self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 1))
                         scout(AbilityId.PATROL, self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 3), True)
                         return
-                if self.proxy_pylon and self.can_afford(UnitTypeId.PHOTONCANNON) and (self.iteration - self.build_timing) > 20 and \
+                if (self.iteration - self.last_photon_builder_action) > 30 and self.proxy_pylon and self.can_afford(UnitTypeId.PHOTONCANNON) and (self.iteration - self.build_timing) > 30 and \
                         (self.structures(UnitTypeId.PHOTONCANNON).not_ready.exists or self.structures(UnitTypeId.PHOTONCANNON).ready.exists) and \
                         self.structures(UnitTypeId.PHOTONCANNON).amount < 4 and self.structures(UnitTypeId.FORGE).ready.exists:
                     pylon = self.structures(UnitTypeId.PYLON).ready.closest_to(scout)
@@ -1012,23 +1113,25 @@ class RaidenBot(BotAI):
                                     .towards(self.enemy_start_locations[0], 2), True)
                         scout.move(self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 1), True)
                         scout(AbilityId.PATROL, self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 3), True)
+                        self.last_photon_builder_action = self.iteration
                     else:
                         if scout.is_idle:
                             scout.move(self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 1))
                             scout(AbilityId.PATROL, self.enemy_main_base_ramp.top_center.towards(self.enemy_main_base_ramp.bottom_center, 3), True)
                             return
-                if self.proxy_pylon and not self.second_proxy and (self.iteration - self.last_highground_pylon_timing) > 30 and \
+                if (self.iteration - self.last_photon_builder_action) > 30 and self.proxy_pylon and not self.second_proxy and (self.iteration - self.last_highground_pylon_timing) > 30 and \
                         self.structures(UnitTypeId.PHOTONCANNON).amount > 1 and \
                         self.can_afford(UnitTypeId.PYLON):
-                    self.iteration = self.last_highground_pylon_timing
+                    self.last_highground_pylon_timing = self.iteration
                     scout.build(UnitTypeId.PYLON, self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 2))
                     scout.build(UnitTypeId.PYLON, position.Point2((self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 2)[0],
                                                                    self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 2)[1] + 1)), True)
                     scout.build(UnitTypeId.PYLON, position.Point2((self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 2)[0],
                                                                    self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 2)[1] - 1)), True)
                     scout.build(UnitTypeId.PYLON, self.enemy_main_base_ramp.top_center.towards(self.enemy_start_locations[0], 3), True)
+                    self.last_photon_builder_action = self.iteration
                     return
-                if self.proxy_pylon and self.can_afford(UnitTypeId.PHOTONCANNON) and \
+                if (self.iteration - self.last_photon_builder_action) > 50 and self.proxy_pylon and self.can_afford(UnitTypeId.PHOTONCANNON) and \
                         self.structures(UnitTypeId.FORGE).ready.exists and not self.already_pending(UnitTypeId.PHOTONCANNON) > 0 and \
                         not self.structures(UnitTypeId.PHOTONCANNON).exists > 0:
                     pylon = self.structures(UnitTypeId.PYLON).ready.closest_to(scout)
@@ -1037,6 +1140,7 @@ class RaidenBot(BotAI):
                         scout.build(UnitTypeId.PHOTONCANNON, pylon.position.towards(self.enemy_natural.position, 2), True)
                         scout.move(self.enemy_natural.position, True)
                         scout(AbilityId.PATROL, self.enemy_natural.position.towards(self.enemy_main_base_ramp.bottom_center, 2), True)
+                        self.last_photon_builder_action = self.iteration
                     else:
                         return
 
@@ -1070,15 +1174,15 @@ class RaidenBot(BotAI):
                 self.rushDetected = True
                 self.scout_tag = None
                 scout.move(self.main_base_ramp.top_center)
-                if self.structures(UnitTypeId.ASSIMILATOR).not_ready.exists:
-                    for assimilator in self.structures(UnitTypeId.ASSIMILATOR).not_ready:
+                if self.structures.of_type(self.assimilatorTypes).not_ready.exists:
+                    for assimilator in self.structures.of_type(self.assimilatorTypes).not_ready:
                         assimilator(AbilityId.CANCEL_BUILDINPROGRESS)
                 if self.structures(UnitTypeId.PHOTONCANNON).not_ready.exists:
                     for canon in self.structures(UnitTypeId.PHOTONCANNON).not_ready:
                         canon(AbilityId.CANCEL_BUILDINPROGRESS)
                 await self.build(UnitTypeId.PYLON, near=self.townhalls.ready.first)
             if scout and scout.shield_percentage < 0.4 and (self.iteration - self.lastAttack) > 50:
-                if self.enemy_natural == self.ordered_enemy_expands_locations[1]:
+                if self.enemy_natural == self.ordered_enemy_expands_locations[1] and scout.distance_to(self.ordered_enemy_expands_locations[2].position) > 10:
                     scout(AbilityId.SMART, self.mineral_field.closest_to(self.ordered_enemy_expands_locations[2].position))
                     scout.move(self.enemy_natural.position.towards(self.game_info.map_center, 12), True)
                     self.lastAttack = self.iteration
@@ -1134,8 +1238,21 @@ class RaidenBot(BotAI):
         return units
 
     def speedmine(self, workers: Units):
+        mineral_field_targeted = {}
         for worker in workers:
-            self.speedmine_single(worker)
+            try:
+                mf = self.mineral_field.by_tag(worker.order_target)
+            except:
+                mf = None
+            if mf is not None and mf.is_mineral_field:
+                if mf.tag not in mineral_field_targeted:
+                    mineral_field_targeted[mf.tag] = 1
+                else:
+                    mineral_field_targeted[mf.tag] += 1
+                if mineral_field_targeted[mf.tag] < 3:
+                    self.speedmine_single(worker)
+            else:
+                self.speedmine_single(worker)
 
     def speedmine_single(self, worker: Unit):
         if self.townhalls.exists:
@@ -1166,11 +1283,36 @@ class RaidenBot(BotAI):
 
     async def build_defensive_structures(self):
         try:
+            if self.already_pending(UnitTypeId.SHIELDBATTERY) > 0:
+                for shieldbattery in self.structures(UnitTypeId.SHIELDBATTERY):
+                    if self.mineral_field.closest_to(shieldbattery).distance_to(shieldbattery) < 3:
+                        shieldbattery(AbilityId.CANCEL_BUILDINPROGRESS)
+            if self.already_pending(UnitTypeId.PHOTONCANNON) > 0:
+                for photon in self.structures(UnitTypeId.PHOTONCANNON):
+                    if self.mineral_field.closest_to(photon).distance_to(photon) < 3 and \
+                            self.townhalls.ready.exists and self.townhalls.ready.closest_to(photon).distance_to(photon) < 9:
+                        photon(AbilityId.CANCEL_BUILDINPROGRESS)
             if self.roach_rush and not self.structures(UnitTypeId.SHIELDBATTERY).ready.exists and not self.already_pending(UnitTypeId.SHIELDBATTERY) > 0 and \
                     self.can_afford(UnitTypeId.SHIELDBATTERY):
                 builder = self.units.find_by_tag(self.builder_tag)
                 if builder:
                     builder.build(UnitTypeId.SHIELDBATTERY, self.main_base_ramp.top_center.towards(self.start_location, 7))
+            if self.enemy_race == Race.Protoss and self.iteration > 1000 and self.can_afford(UnitTypeId.PYLON):
+                if not self.already_pending(UnitTypeId.SHIELDBATTERY) > 0:
+                    for nexus in self.townhalls:
+                        if not nexus.distance_to(self.start_location) < 3 and not self.structures(UnitTypeId.PYLON).closer_than(7, nexus).ready.exists:
+                            if not self.already_pending(UnitTypeId.PYLON) > 0:
+                                mineral = self.mineral_field.closer_than(7, nexus).random
+                                target = self.calculatePylonPos(4, nexus, mineral)
+                                await self.build(UnitTypeId.PYLON, near=target)
+                        if not nexus.distance_to(self.start_location) < 3 and self.structures(UnitTypeId.PYLON).closer_than(7, nexus).ready.exists:
+                            if not self.structures(UnitTypeId.SHIELDBATTERY).closer_than(8, nexus).ready.exists:
+                                await self.build(UnitTypeId.SHIELDBATTERY, near=nexus)
+                                return
+                            elif self.structures(UnitTypeId.SHIELDBATTERY).closer_than(8, nexus).ready.exists and \
+                                    self.structures(UnitTypeId.SHIELDBATTERY).closer_than(8, nexus).ready.amount < 2:
+                                await self.build(UnitTypeId.SHIELDBATTERY, near=nexus)
+                                return
             if self.iteration > 2000 and self.structures(UnitTypeId.FORGE).ready.exists:
                 if self.already_pending(UnitTypeId.PHOTONCANNON) or self.already_pending(UnitTypeId.SHIELDBATTERY):
                     ongoing_structures = self.structures.of_type({UnitTypeId.PHOTONCANNON, UnitTypeId.SHIELDBATTERY}).not_ready
@@ -1186,7 +1328,7 @@ class RaidenBot(BotAI):
                         if not nexus.distance_to(self.start_location) < 3:
                             if not self.structures(UnitTypeId.PYLON).closer_than(7, nexus).ready.exists:
                                 mineral = self.mineral_field.closer_than(7, nexus).random
-                                target = self.calculatePylonPos(5, nexus, mineral)
+                                target = self.calculatePylonPos(4, nexus, mineral)
                                 await self.build(UnitTypeId.PYLON, near=target)
                             elif not self.structures(UnitTypeId.PHOTONCANNON).closer_than(7, nexus).ready.exists:
                                 await self.build(UnitTypeId.PHOTONCANNON, near=nexus)
@@ -1204,70 +1346,74 @@ class RaidenBot(BotAI):
         try:
             for nexus in self.townhalls.ready:
                 # Chrono nexus if cybercore is not ready, else chrono cybercore
-                if self.iteration > 150 and not (self.enemy_race == Race.Protoss and self.structures(UnitTypeId.GATEWAY).ready.amount == 1) \
-                        and not (self.enemy_race == Race.Terran and self.structures(UnitTypeId.GATEWAY).ready.amount == 1) and \
-                        not (self.rushDetected is True and self.iteration < 600) and not 0 < self.already_pending_upgrade(
-                    UpgradeId.WARPGATERESEARCH) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.BLINKTECH) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.CHARGE) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PSISTORMTECH) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.EXTENDEDTHERMALLANCE) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDWEAPONSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDARMORSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDARMORSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDARMORSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRARMORSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRARMORSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRARMORSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRWEAPONSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRWEAPONSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) < 1:
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST) and not nexus.is_idle:
-                        if nexus.energy >= 50:
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, nexus)
-                elif self.enemy_race != Race.Zerg and \
-                        self.structures.of_type({UnitTypeId.GATEWAY, UnitTypeId.WARPGATE}).ready.exists and \
-                        self.already_pending(UnitTypeId.STALKER) and self.iteration < 1000:
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.GATEWAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.GATEWAY).ready.first)
-                elif self.rushDetected is True and self.structures(UnitTypeId.GATEWAY).ready.exists and self.already_pending(UnitTypeId.ZEALOT) and self.iteration < 500:
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.GATEWAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.GATEWAY).ready.first)
-                elif self.structures(UnitTypeId.STARGATE).ready.exists and self.already_pending(UnitTypeId.VOIDRAY):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.STARGATE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.STARGATE).ready.first)
-                elif self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.BLINKTECH) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first)
-                elif self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.CHARGE) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first)
-                elif self.structures(UnitTypeId.ROBOTICSBAY).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.EXTENDEDTHERMALLANCE) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.ROBOTICSBAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.ROBOTICSBAY).ready.first)
-                elif self.structures(UnitTypeId.TEMPLARARCHIVE).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.PSISTORMTECH) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.TEMPLARARCHIVE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TEMPLARARCHIVE).ready.first)
-                elif self.structures(UnitTypeId.FORGE).ready.exists and (
-                        0 < self.already_pending_upgrade(UpgradeId.PROTOSSGROUNDWEAPONSLEVEL1) < 1 or 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2) < 1 or 0 < self.already_pending_upgrade(UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.FORGE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.FORGE).ready.first)
-                elif self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists and (
-                        0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) < 1 or 0 < self.already_pending_upgrade(
-                    UpgradeId.PROTOSSAIRWEAPONSLEVEL2) < 1 or 0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) < 1):
-                    if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                        if nexus.energy >= 50 and not self.structures(UnitTypeId.FORGE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
-                            nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.CYBERNETICSCORE).ready.first)
+                if nexus.distance_to(self.start_location) < 10 or nexus.energy > 100:
+                    if self.iteration > 150 and not (self.enemy_race == Race.Protoss and self.structures(UnitTypeId.GATEWAY).ready.amount == 1) \
+                            and not (self.enemy_race == Race.Terran and self.structures(UnitTypeId.GATEWAY).ready.amount == 1) and \
+                            not (self.rushDetected is True and self.iteration < 600) and not 0 < self.already_pending_upgrade(
+                        UpgradeId.WARPGATERESEARCH) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.BLINKTECH) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.CHARGE) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PSISTORMTECH) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.EXTENDEDTHERMALLANCE) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDWEAPONSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDARMORSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDARMORSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDARMORSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRARMORSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRARMORSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRARMORSLEVEL3) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRWEAPONSLEVEL1) < 1 and not 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRWEAPONSLEVEL2) < 1 and not 0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) < 1:
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST) and not nexus.is_idle:
+                            if nexus.energy >= 50:
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, nexus)
+                    elif self.enemy_race != Race.Zerg and \
+                            self.structures.of_type({UnitTypeId.GATEWAY, UnitTypeId.WARPGATE}).ready.exists and \
+                            self.already_pending(UnitTypeId.STALKER) and self.iteration < 1000:
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.GATEWAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.GATEWAY).ready.first)
+                    elif self.rushDetected is True and self.structures(UnitTypeId.GATEWAY).ready.exists and self.already_pending(UnitTypeId.ZEALOT) and self.iteration < 500:
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and self.structures(UnitTypeId.GATEWAY).ready.first.is_active and \
+                                    not self.structures(UnitTypeId.GATEWAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.GATEWAY).ready.first)
+                    elif self.structures(UnitTypeId.STARGATE).ready.exists and self.already_pending(UnitTypeId.VOIDRAY):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            for stargate in self.structures(UnitTypeId.STARGATE):
+                                if nexus.energy >= 50 and not stargate.has_buff(BuffId.CHRONOBOOSTENERGYCOST) and \
+                                        stargate.is_active:
+                                    nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, stargate)
+                    elif self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.BLINKTECH) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first)
+                    elif self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.CHARGE) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TWILIGHTCOUNCIL).ready.first)
+                    elif self.structures(UnitTypeId.ROBOTICSBAY).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.EXTENDEDTHERMALLANCE) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.ROBOTICSBAY).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.ROBOTICSBAY).ready.first)
+                    elif self.structures(UnitTypeId.TEMPLARARCHIVE).ready.exists and (0 < self.already_pending_upgrade(UpgradeId.PSISTORMTECH) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.TEMPLARARCHIVE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.TEMPLARARCHIVE).ready.first)
+                    elif self.structures(UnitTypeId.FORGE).ready.exists and (
+                            0 < self.already_pending_upgrade(UpgradeId.PROTOSSGROUNDWEAPONSLEVEL1) < 1 or 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2) < 1 or 0 < self.already_pending_upgrade(UpgradeId.PROTOSSGROUNDWEAPONSLEVEL3) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.FORGE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.FORGE).ready.first)
+                    elif self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists and (
+                            0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) < 1 or 0 < self.already_pending_upgrade(
+                        UpgradeId.PROTOSSAIRWEAPONSLEVEL2) < 1 or 0 < self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) < 1):
+                        if not nexus.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                            if nexus.energy >= 50 and not self.structures(UnitTypeId.FORGE).ready.first.has_buff(BuffId.CHRONOBOOSTENERGYCOST):
+                                nexus(AbilityId.EFFECT_CHRONOBOOSTENERGYCOST, self.structures(UnitTypeId.CYBERNETICSCORE).ready.first)
         except:
             return
 
@@ -1313,20 +1459,40 @@ class RaidenBot(BotAI):
         escape_location = scoutingObs.position.towards(position.Point2(position.Pointlike(targetEscapePosition)), 2)
         return position.Point2(position.Pointlike(escape_location))
 
+    async def handleBatteryOverchage(self):
+        for nexus in self.structures(UnitTypeId.NEXUS).ready:
+            if nexus.tag in self.availableStructuresAbilities.keys():
+                if AbilityId.BATTERYOVERCHARGE_BATTERYOVERCHARGE in self.availableStructuresAbilities.get(nexus.tag, set()):
+                    enemy = self.enemy_units.closest_to(nexus) if self.enemy_units.exists else None
+                    shieldbattery = self.structures(UnitTypeId.SHIELDBATTERY).ready.closer_than(7, nexus) if self.structures(UnitTypeId.SHIELDBATTERY).ready.closer_than(7, nexus).exists else None
+                    ally_units = self.units.of_type(ALLY_FIGHTING_UNITS).ready.closer_than(10, nexus.position) if self.units.of_type(ALLY_FIGHTING_UNITS).ready.closer_than(10, nexus.position).exists else None
+                    if enemy and shieldbattery and ally_units and shieldbattery.first.is_powered:
+                        if enemy.distance_to(nexus) < 12:
+                            for ally_unit in ally_units:
+                                if ally_unit.shield_percentage < 0.5:
+                                    nexus(AbilityId.BATTERYOVERCHARGE_BATTERYOVERCHARGE, shieldbattery.first)
+                                    break
+
     async def handleBlink(self):
         for stalker in self.units(UnitTypeId.STALKER).ready:
             if stalker.tag in self.availableUnitsAbilities.keys():
                 if AbilityId.EFFECT_BLINK_STALKER in self.availableUnitsAbilities.get(stalker.tag, set()):
                     enemy = self.enemy_units.closest_to(stalker) if self.enemy_units.exists else None
                     if enemy:
-                        if enemy.is_flying and enemy.distance_to(stalker) < 12 and self.units(UnitTypeId.STALKER).closer_than(5, stalker.position).exists:
-                            if self.units(UnitTypeId.STALKER).closer_than(5, stalker.position).amount > 4:
-                                for stalker_in_area in self.units(UnitTypeId.STALKER).closer_than(5, stalker.position):
+                        if (enemy.is_flying or enemy.type_id == UnitTypeId.SIEGETANKSIEGED or enemy.type_id == UnitTypeId.SIEGETANK) and \
+                                enemy.distance_to(stalker) < 12 and self.units(UnitTypeId.STALKER).closer_than(5, stalker.position).exists:
+                            if self.units(UnitTypeId.STALKER).closer_than(6, stalker.position).amount > 4:
+                                for stalker_in_area in self.units(UnitTypeId.STALKER).closer_than(6, stalker.position):
                                     targetOffensiveBlinkPosition = self.calculateOffensiveBlinkDest(stalker_in_area, enemy)
                                     if stalker_in_area.in_ability_cast_range(AbilityId.EFFECT_BLINK_STALKER, targetOffensiveBlinkPosition) \
                                             and self.in_pathing_grid(targetOffensiveBlinkPosition):
                                         stalker_in_area(AbilityId.EFFECT_BLINK_STALKER, targetOffensiveBlinkPosition)
-                                        stalker_in_area.attack(enemy, True)
+                                        if not enemy.type_id == UnitTypeId.INTERCEPTOR:
+                                            stalker_in_area.attack(enemy, True)
+                                        else:
+                                            for nearby_enemy in self.enemy_units.closer_than(13, stalker):
+                                                if nearby_enemy.type_id == UnitTypeId.CARRIER:
+                                                    stalker_in_area.attack(nearby_enemy, True)
                                 break
                         if stalker.shield_percentage < 0.1 and stalker.is_attacking:
                             targetBlinkPosition = self.calculateBlinkDest(stalker, enemy)
@@ -1349,7 +1515,41 @@ class RaidenBot(BotAI):
                             ht(AbilityId.PSISTORM_PSISTORM, targetStormPosition)
 
     async def handleKiting(self):
+        offensive_unit_types = {UnitTypeId.ZEALOT,
+                                UnitTypeId.PROBE,
+                                UnitTypeId.STALKER,
+                                UnitTypeId.IMMORTAL,
+                                UnitTypeId.VOIDRAY,
+                                UnitTypeId.ARCHON,
+                                UnitTypeId.ADEPT,
+                                UnitTypeId.SCV,
+                                UnitTypeId.MARINE,
+                                UnitTypeId.MARAUDER,
+                                UnitTypeId.VIKING,
+                                UnitTypeId.GHOST,
+                                UnitTypeId.SIEGETANK,
+                                UnitTypeId.BATTLECRUISER,
+                                UnitTypeId.THOR,
+                                UnitTypeId.DRONE,
+                                UnitTypeId.ROACH,
+                                UnitTypeId.HYDRALISK,
+                                UnitTypeId.ULTRALISK,
+                                UnitTypeId.BANELING,
+                                UnitTypeId.MUTALISK,
+                                UnitTypeId.AUTOTURRET}
         for effect in self.state.effects:
+            if effect.id == EffectId.BLINDINGCLOUDCP:
+                positions = effect.positions
+                for unit in self.units:
+                    for pos in positions:
+                        if unit.position.distance_to(pos) < 6:
+                            if self.enemy_units.exists:
+                                enemy = self.enemy_units.closest_to(unit)
+                                if enemy:
+                                    unit.move(self.calculateDodgeDest(unit, enemy))
+                                    break
+                            else:
+                                unit.move(unit.position.towards(position.Point2(position.Pointlike(self.start_location)), 3))
             if effect.id == EffectId.RAVAGERCORROSIVEBILECP or effect.id == EffectId.PSISTORMPERSISTENT:
                 positions = effect.positions
                 for unit in self.units:
@@ -1362,6 +1562,29 @@ class RaidenBot(BotAI):
                                     break
                             else:
                                 unit.move(unit.position.towards(position.Point2(position.Pointlike(self.start_location)), 3))
+            if effect.id == EffectId.LIBERATORTARGETMORPHPERSISTENT or effect.id == EffectId.LIBERATORTARGETMORPHPERSISTENT:
+                positions = effect.positions
+                for unit in self.units:
+                    if unit.type_id != UnitTypeId.STALKER and not unit.is_flying:
+                        for pos in positions:
+                            if unit.position.distance_to(pos) < 6:
+                                if self.enemy_units.exists:
+                                    enemy = self.enemy_units.closest_to(unit)
+                                    if enemy:
+                                        unit.move(self.calculateDodgeDest(unit, enemy))
+                                        break
+                                else:
+                                    unit.move(pos.towards(unit.position, 3))
+        for enemy_spell in self.enemy_units.of_type({UnitTypeId.DISRUPTORPHASED, UnitTypeId.KD8CHARGE}):
+            pos = enemy_spell.position
+            for unit in self.units:
+                if unit.position.distance_to(pos) < 7:
+                    if self.enemy_units.exists:
+                        enemy = self.enemy_units.closest_to(unit)
+                        if enemy:
+                            unit.move(self.calculateDodgeDest(unit, enemy))
+                    else:
+                        unit.move(pos.towards(unit.position, 3))
         for stalker in self.units(UnitTypeId.STALKER).ready:
             if self.iteration % 4 == 0:
                 if not stalker.tag in self.no_kiting_delay_map:
@@ -1377,56 +1600,36 @@ class RaidenBot(BotAI):
                     self.pf_build = True
                     kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 6)
                     stalker.move(kite_location)
-                offensive_unit_types = {UnitTypeId.ZEALOT,
-                                        UnitTypeId.PROBE,
-                                        UnitTypeId.STALKER,
-                                        UnitTypeId.IMMORTAL,
-                                        UnitTypeId.VOIDRAY,
-                                        UnitTypeId.ARCHON,
-                                        UnitTypeId.ADEPT,
-                                        UnitTypeId.SCV,
-                                        UnitTypeId.MARINE,
-                                        UnitTypeId.MARAUDER,
-                                        UnitTypeId.GHOST,
-                                        UnitTypeId.SIEGETANK,
-                                        UnitTypeId.BATTLECRUISER,
-                                        UnitTypeId.THOR,
-                                        UnitTypeId.DRONE,
-                                        UnitTypeId.ROACH,
-                                        UnitTypeId.HYDRALISK,
-                                        UnitTypeId.ULTRALISK,
-                                        UnitTypeId.BANELING,
-                                        UnitTypeId.MUTALISK}
                 enemy = self.enemy_units.of_type(offensive_unit_types).closest_to(stalker) if self.enemy_units.of_type(offensive_unit_types).exists else None
                 if enemy and (self.iteration - self.no_kiting_delay_map[stalker.tag]) > 20 and not ((enemy.type_id == UnitTypeId.PROBE or
                                                                                                      enemy.type_id == UnitTypeId.SCV or
                                                                                                      enemy.type_id == UnitTypeId.DRONE) and
-                                                                                                    self.enemy_units.closer_than(4, enemy).amount < 3):
+                                                                                                    self.enemy_units.closer_than(4, enemy).amount < 4):
                     if self.enemy_race == Race.Protoss:
                         if enemy.type_id == UnitTypeId.ZEALOT:
-                            if enemy.distance_to(stalker) < 4 or (enemy.distance_to(stalker) < 6 and stalker.shield_percentage < 0.2) and \
-                                    stalker.distance_to(self.start_location) > 6 and self.townhalls.ready.exists and \
-                                    not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
-                                kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
+                            if enemy.distance_to(stalker) < 6 or (enemy.distance_to(stalker) < 7 and stalker.shield_percentage < 0.2) and \
+                                    stalker.distance_to(self.start_location) > 7 and self.townhalls.ready.exists and \
+                                    not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.2):
+                                kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 3)
                                 second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
-                                if stalker.health_percentage < 0.3 and stalker.distance_to(self.main_base_ramp.top_center) > 6:
+                                if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 6:
                                     stalker.move(self.main_base_ramp.top_center)
                                     self.no_kiting_delay_map[stalker.tag] = self.iteration
                                     continue
                                 if self.in_pathing_grid(kite_location):
                                     stalker.move(kite_location)
-                                    if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                    if stalker.shield_percentage > 0.1:
                                         stalker.attack(enemy.position, True)
                                 elif self.in_pathing_grid(second_kite_location):
                                     stalker.move(second_kite_location)
-                                    if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                    if stalker.shield_percentage > 0.1:
                                         stalker.attack(enemy.position, True)
                                 elif stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                     self.no_kiting_delay_map[stalker.tag] = self.iteration
                                     stalker.move(self.main_base_ramp.top_center)
-                        elif enemy.distance_to(stalker) < 6 or (enemy.distance_to(stalker) < 7 and stalker.shield_percentage < 0.2) and \
+                        elif (enemy.distance_to(stalker) < 7 or (enemy.distance_to(stalker) < 8.5 and stalker.shield_percentage < 0.2)) and \
                                 stalker.distance_to(self.start_location) > 6 and self.townhalls.ready.exists and \
-                                not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
+                                not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.2):
                             if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 6:
                                 stalker.move(self.main_base_ramp.top_center)
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
@@ -1435,20 +1638,41 @@ class RaidenBot(BotAI):
                             second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
                             if self.in_pathing_grid(kite_location):
                                 stalker.move(kite_location)
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif self.in_pathing_grid(second_kite_location):
                                 stalker.move(second_kite_location)
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
                                 stalker.move(self.main_base_ramp.top_center)
                     if self.enemy_race == Race.Terran:
+                        if enemy.type_id in ENEMY_TRAP_UNITS and enemy.distance_to(stalker) < 7.5:
+                            close_detection = self.units(UnitTypeId.OBSERVER).closer_than(3, stalker)
+                            if close_detection:
+                                safe_position = enemy.position.towards(position.Point2(position.Pointlike(stalker.position)), 8)
+                                stalker.move(safe_position)
+                                stalker.attack(enemy.position, True)
+                                continue
+                            kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
+                            second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
+                            if self.in_pathing_grid(kite_location):
+                                stalker.move(kite_location)
+                                if stalker.shield_percentage > 0.1:
+                                    stalker.attack(enemy.position, True)
+                            elif self.in_pathing_grid(second_kite_location):
+                                stalker.move(stalker.position.towards(self.start_location, 6))
+                                if stalker.shield_percentage > 0.1:
+                                    stalker.attack(enemy.position, True)
+                            elif stalker.distance_to(self.main_base_ramp.top_center) > 15:
+                                self.no_kiting_delay_map[stalker.tag] = self.iteration
+                                stalker.move(self.main_base_ramp.top_center)
+                            continue
                         if enemy.distance_to(stalker) < 6 < stalker.distance_to(self.start_location) or \
-                                (enemy.distance_to(stalker) < 6 and stalker.shield_percentage < 0.2) and \
+                                (enemy.distance_to(stalker) < 7 and stalker.shield_percentage < 0.2) and \
                                 not enemy.type_id == UnitTypeId.LIBERATOR and self.townhalls.ready.exists and \
-                                not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.1):
+                                not stalker.is_facing(self.townhalls.ready.closest_to(self.start_location), 0.2):
                             if stalker.health_percentage < 0.3 and stalker.shield_percentage < 0.1 and stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 stalker.move(self.main_base_ramp.top_center)
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
@@ -1457,11 +1681,11 @@ class RaidenBot(BotAI):
                             second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
                             if self.in_pathing_grid(kite_location):
                                 stalker.move(kite_location)
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif self.in_pathing_grid(second_kite_location):
                                 stalker.move(stalker.position.towards(self.start_location, 6))
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
@@ -1480,11 +1704,11 @@ class RaidenBot(BotAI):
                             second_kite_location = stalker.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
                             if self.in_pathing_grid(kite_location):
                                 stalker.move(kite_location)
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif self.in_pathing_grid(second_kite_location):
                                 stalker.move(second_kite_location)
-                                if stalker.health_percentage > 0.4 and stalker.shield_percentage > 0.1:
+                                if stalker.shield_percentage > 0.1:
                                     stalker.attack(enemy.position, True)
                             elif stalker.distance_to(self.main_base_ramp.top_center) > 15:
                                 self.no_kiting_delay_map[stalker.tag] = self.iteration
@@ -1496,54 +1720,107 @@ class RaidenBot(BotAI):
                             stalker.move(kite_location)
 
         for supportUnit in self.units.of_type({UnitTypeId.SENTRY, UnitTypeId.IMMORTAL}).ready:
-            if not supportUnit.tag in self.no_kiting_delay_map:
-                self.no_kiting_delay_map[supportUnit.tag] = 0
-            enemy = self.enemy_units.closest_to(supportUnit) if self.enemy_units.exists else None
-            if enemy and (self.iteration - self.no_kiting_delay_map[supportUnit.tag]) > 20 and supportUnit.distance_to(self.start_location) > 6:
-                if enemy.distance_to(supportUnit) < 6 < supportUnit.distance_to(self.start_location) and supportUnit.shield_percentage < 0.8:
-                    kite_location = supportUnit.position.towards(self.start_location, 2)
-                    second_kite_location = supportUnit.position.towards(self.start_location, 5)
+            if self.iteration % 4 == 0:
+                if not supportUnit.tag in self.no_kiting_delay_map:
+                    self.no_kiting_delay_map[supportUnit.tag] = 0
+                enemy = self.enemy_units.of_type(offensive_unit_types).closest_to(supportUnit) if self.enemy_units.of_type(offensive_unit_types).exists else None
+                if enemy and (self.iteration - self.no_kiting_delay_map[supportUnit.tag]) > 20 and enemy.type_id in ENEMY_TRAP_UNITS and enemy.distance_to(supportUnit) < 8:
+                    kite_location = supportUnit.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
+                    second_kite_location = supportUnit.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
                     if self.in_pathing_grid(kite_location):
                         supportUnit.move(kite_location)
                         if supportUnit.health_percentage > 0.4 and supportUnit.shield_percentage > 0.1:
                             supportUnit.attack(enemy.position, True)
                     elif self.in_pathing_grid(second_kite_location):
-                        supportUnit.move(supportUnit.position.towards(self.start_location, 6))
+                        supportUnit.move(second_kite_location)
                         if supportUnit.health_percentage > 0.4 and supportUnit.shield_percentage > 0.1:
                             supportUnit.attack(enemy.position, True)
                     elif supportUnit.distance_to(self.main_base_ramp.top_center) > 15:
                         self.no_kiting_delay_map[supportUnit.tag] = self.iteration
                         supportUnit.move(self.main_base_ramp.top_center)
+                    continue
+                if enemy and (self.iteration - self.no_kiting_delay_map[supportUnit.tag]) > 20 and supportUnit.distance_to(self.start_location) > 6:
+                    if enemy.distance_to(supportUnit) < 7 < supportUnit.distance_to(self.start_location) and supportUnit.shield_percentage < 0.4:
+                        kite_location = supportUnit.position.towards(self.start_location, 2)
+                        second_kite_location = supportUnit.position.towards(self.start_location, 5)
+                        if self.in_pathing_grid(kite_location):
+                            supportUnit.move(kite_location)
+                            if supportUnit.shield_percentage > 0.1:
+                                supportUnit.attack(enemy.position, True)
+                        elif self.in_pathing_grid(second_kite_location):
+                            supportUnit.move(supportUnit.position.towards(self.start_location, 6))
+                            if supportUnit.shield_percentage > 0.1:
+                                supportUnit.attack(enemy.position, True)
+                        elif supportUnit.distance_to(self.main_base_ramp.top_center) > 15:
+                            self.no_kiting_delay_map[supportUnit.tag] = self.iteration
+                            supportUnit.move(self.main_base_ramp.top_center)
 
         for colossy in self.units.of_type({UnitTypeId.COLOSSUS}).ready:
-            if not colossy.tag in self.no_kiting_delay_map:
-                self.no_kiting_delay_map[colossy.tag] = 0
-            enemy = self.enemy_units.closest_to(colossy) if self.enemy_units.exists else None
-            if enemy and (self.iteration - self.no_kiting_delay_map[colossy.tag]) > 20:
-                if enemy.distance_to(colossy) < 7 and colossy.distance_to(self.start_location) > 4:
-                    kite_location = colossy.position.towards(position.Point2(position.Pointlike(self.start_location)), 4)
+            if self.iteration % 4 == 0:
+                if not colossy.tag in self.no_kiting_delay_map:
+                    self.no_kiting_delay_map[colossy.tag] = 0
+                enemy = self.enemy_units.of_type(offensive_unit_types).closest_to(colossy) if self.enemy_units.of_type(offensive_unit_types).exists else None
+                if enemy and enemy.type_id in ENEMY_TRAP_UNITS and enemy.distance_to(colossy) < 9:
+                    kite_location = colossy.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
+                    second_kite_location = colossy.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
                     if self.in_pathing_grid(kite_location):
                         colossy.move(kite_location)
-                        if colossy.health_percentage > 0.4 and colossy.shield_percentage > 0.1:
+                        if colossy.shield_percentage > 0.1:
+                            colossy.attack(enemy.position, True)
+                    elif self.in_pathing_grid(second_kite_location):
+                        colossy.move(second_kite_location)
+                        if colossy.shield_percentage > 0.1:
                             colossy.attack(enemy.position, True)
                     elif colossy.distance_to(self.main_base_ramp.top_center) > 15:
                         self.no_kiting_delay_map[colossy.tag] = self.iteration
                         colossy.move(self.main_base_ramp.top_center)
-                    else:
-                        colossy.move(self.start_location)
+                    continue
+                if enemy and (self.iteration - self.no_kiting_delay_map[colossy.tag]) > 20:
+                    if enemy.distance_to(colossy) < 7 and colossy.distance_to(self.start_location) > 4:
+                        kite_location = colossy.position.towards(position.Point2(position.Pointlike(self.start_location)), 4)
+                        if self.in_pathing_grid(kite_location):
+                            colossy.move(kite_location)
+                            if colossy.shield_percentage > 0.1:
+                                colossy.attack(enemy.position, True)
+                        elif colossy.distance_to(self.main_base_ramp.top_center) > 15:
+                            self.no_kiting_delay_map[colossy.tag] = self.iteration
+                            colossy.move(self.main_base_ramp.top_center)
+                        else:
+                            colossy.move(self.start_location)
 
         for casterUnit in self.units(UnitTypeId.HIGHTEMPLAR).ready:
-            enemy = self.enemy_units.closest_to(casterUnit) if self.enemy_units.exists else None
-            if enemy:
-                if enemy.distance_to(casterUnit) < 7:
-                    if casterUnit.health_percentage < 0.3:
-                        casterUnit.move(self.main_base_ramp.top_center)
-                        continue
-                    kite_location = casterUnit.position.towards(position.Point2(position.Pointlike(self.start_location)), 6)
-                    casterUnit.move(kite_location)
-            for templar in self.units.of_type({UnitTypeId.HIGHTEMPLAR, UnitTypeId.DARKTEMPLAR}):
-                if templar.distance_to(casterUnit) < 4 and templar.energy_percentage < 0.2 and casterUnit.energy_percentage < 0.2:
-                    templar(AbilityId.MORPH_ARCHON)
+            if self.iteration % 4 == 0:
+                enemy = self.enemy_units.closest_to(casterUnit) if self.enemy_units.exists else None
+                if enemy:
+                    if enemy.distance_to(casterUnit) < 7:
+                        if casterUnit.health_percentage < 0.3:
+                            casterUnit.move(self.main_base_ramp.top_center)
+                            continue
+                        kite_location = casterUnit.position.towards(position.Point2(position.Pointlike(self.start_location)), 6)
+                        casterUnit.move(kite_location)
+                for templar in self.units.of_type({UnitTypeId.HIGHTEMPLAR, UnitTypeId.DARKTEMPLAR}):
+                    if templar.distance_to(casterUnit) < 4 and templar.energy_percentage < 0.2 and casterUnit.energy_percentage < 0.2:
+                        templar(AbilityId.MORPH_ARCHON)
+
+        for zealot in self.units(UnitTypeId.ZEALOT).ready:
+            if self.iteration % 4 == 0:
+                if not zealot.tag in self.no_kiting_delay_map:
+                    self.no_kiting_delay_map[zealot.tag] = 0
+                enemy = self.enemy_units.of_type(offensive_unit_types).closest_to(zealot) if self.enemy_units.of_type(offensive_unit_types).exists else None
+                if enemy and (self.iteration - self.no_kiting_delay_map[zealot.tag]) > 20 and enemy.type_id in ENEMY_TRAP_UNITS and enemy.distance_to(zealot) < 9:
+                    kite_location = zealot.position.towards(position.Point2(position.Pointlike(self.start_location)), 2)
+                    second_kite_location = zealot.position.towards(position.Point2(position.Pointlike(self.start_location)), 5)
+                    if self.in_pathing_grid(kite_location):
+                        zealot.move(kite_location)
+                        if zealot.shield_percentage > 0.1:
+                            zealot.attack(enemy.position, True)
+                    elif self.in_pathing_grid(second_kite_location):
+                        zealot.move(second_kite_location)
+                        if zealot.shield_percentage > 0.1:
+                            zealot.attack(enemy.position, True)
+                    elif zealot.distance_to(self.main_base_ramp.top_center) > 15:
+                        self.no_kiting_delay_map[zealot.tag] = self.iteration
+                        zealot.move(self.main_base_ramp.top_center)
 
     async def handleSentry(self):
         if self.units(UnitTypeId.SENTRY).ready.exists:
@@ -1562,9 +1839,33 @@ class RaidenBot(BotAI):
         if self.units(UnitTypeId.VOIDRAY).ready.exists:
             voidrays = self.units(UnitTypeId.VOIDRAY).ready
             for voidray in voidrays:
-                if self.enemy_units.amount > 0:
+                last_attack = 0
+                if voidray.tag in self.voidray_last_attack_move:
+                    last_attack = self.voidray_last_attack_move[voidray.tag]
+                if self.enemy_units.amount > 0 and self.iteration - last_attack > 40:
                     enemy = self.enemy_units.closest_to(voidray)
+                    if enemy and enemy.type_id in ENEMY_TRAP_UNITS and enemy.distance_to(voidray) < 8.5:
+                        kite_location = voidray.position.towards(position.Point2(position.Pointlike(self.start_location)), 4)
+                        close_voidrays = self.units(UnitTypeId.VOIDRAY).closer_than(7, voidray)
+                        close_detection = self.units(UnitTypeId.OBSERVER).closer_than(3, voidray)
+                        if close_detection and close_voidrays and close_voidrays.amount > 5:
+                            for voids in close_voidrays:
+                                voids.attack(enemy.position)
+                                self.voidray_last_attack_move[voids.tag] = self.iteration
+                            voidray.attack(enemy.position)
+                            self.voidray_last_attack_move[voidray.tag] = self.iteration
+                            break
+                        if self.in_pathing_grid(kite_location):
+                            voidray.move(kite_location)
+                            if voidray.health_percentage > 0.4 and voidray.shield_percentage > 0.1:
+                                voidray.attack(enemy.position, True)
                     if enemy:
+                        if enemy.type_id == UnitTypeId.INTERCEPTOR:
+                            for nearby_enemy in self.enemy_units.closer_than(12, voidray):
+                                if nearby_enemy.type_id == UnitTypeId.CARRIER:
+                                    voidray.attack(nearby_enemy)
+                                    self.voidray_last_attack_move[voidray.tag] = self.iteration
+                                    break
                         if not voidray.is_using_ability(AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT) and voidray.distance_to(enemy) < 6 and enemy.is_armored and \
                                 not enemy.is_detector and AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT in self.availableUnitsAbilities.get(voidray.tag, set()):
                             voidray(AbilityId.EFFECT_VOIDRAYPRISMATICALIGNMENT)
@@ -1581,10 +1882,27 @@ class RaidenBot(BotAI):
             scoutingObs = self.units.find_by_tag(self.scoutingObsTag)
         if scoutingObs:
             enemies = self.enemy_units.closer_than(12, scoutingObs)
-            enemy_structures = self.enemy_structures.closer_than(12, scoutingObs)
+            enemy_structures = self.enemy_structures.closer_than(10, scoutingObs)
             if enemies.amount > 0:
                 for enemy in enemies:
-                    if enemy.is_detector:
+                    if enemy.is_detector or enemy.type_id == UnitTypeId.WIDOWMINEBURROWED:
+                        targetEscapePosition = self.calculateScoutEscape(scoutingObs, enemy)
+                        scoutingObs.move(targetEscapePosition)
+            if enemy_structures.amount > 0:
+                for enemy_structure in enemy_structures:
+                    if enemy_structure.is_detector:
+                        targetEscapePosition = self.calculateScoutEscape(scoutingObs, enemy_structure)
+                        scoutingObs.move(targetEscapePosition)
+        if self.followingObsTag:
+            scoutingObs = self.units.find_by_tag(self.followingObsTag)
+        else:
+            scoutingObs = None
+        if scoutingObs:
+            enemies = self.enemy_units.closer_than(8, scoutingObs)
+            enemy_structures = self.enemy_structures.closer_than(10, scoutingObs)
+            if enemies.amount > 0:
+                for enemy in enemies:
+                    if enemy.is_detector or enemy.type_id == UnitTypeId.WIDOWMINEBURROWED:
                         targetEscapePosition = self.calculateScoutEscape(scoutingObs, enemy)
                         scoutingObs.move(targetEscapePosition)
             if enemy_structures.amount > 0:
@@ -1597,6 +1915,12 @@ class RaidenBot(BotAI):
         if self.units.ready:
             try:
                 self.units_abilities = await self.get_available_abilities(self.units.ready)
+                self.structures_abilities = await self.get_available_abilities(self.structures.ready)
+                for abilities in self.structures_abilities:
+                    if abilities.__contains__(AbilityId.BATTERYOVERCHARGE_BATTERYOVERCHARGE):
+                        self.availableStructuresAbilities = await self.client.query_available_abilities_with_tag(
+                            self.structures.of_type(UnitTypeId.NEXUS).ready
+                        )
                 for abilities in self.units_abilities:
                     if abilities.__contains__(AbilityId.EFFECT_BLINK_STALKER) or \
                             abilities.__contains__(AbilityId.PSISTORM_PSISTORM) or \
@@ -1746,6 +2070,7 @@ class RaidenBot(BotAI):
             UnitTypeId.PYLON: [3, (20, 235, 0)],
             UnitTypeId.PROBE: [1, (55, 200, 0)],
             UnitTypeId.ASSIMILATOR: [2, (55, 200, 0)],
+            UnitTypeId.ASSIMILATORRICH: [2, (55, 200, 0)],
             UnitTypeId.GATEWAY: [3, (200, 100, 0)],
             UnitTypeId.ROBOTICSFACILITY: [3, (200, 100, 0)],
             UnitTypeId.ROBOTICSBAY: [2, (200, 100, 0)],
@@ -1874,11 +2199,11 @@ class RaidenBot(BotAI):
                         if vespenes:
                             for vespene in vespenes:
                                 if self.can_afford(UnitTypeId.ASSIMILATOR) and not self.already_pending(
-                                        UnitTypeId.ASSIMILATOR) > 0:
+                                        UnitTypeId.ASSIMILATOR) > 0 and not self.already_pending(UnitTypeId.ASSIMILATORRICH) > 0:
                                     worker = self.select_build_worker(vespene.position, True)
                                     if worker is None:
                                         return
-                                    if not self.structures(UnitTypeId.ASSIMILATOR).closer_than(1.0, vespene).exists:
+                                    if not self.structures.of_type(self.assimilatorTypes).closer_than(1.0, vespene).exists:
                                         worker.build(UnitTypeId.ASSIMILATOR, vespene, True)
                                         worker.gather(self.mineral_field.closest_to(worker), True)
                                         return
@@ -1886,13 +2211,16 @@ class RaidenBot(BotAI):
             return
 
     async def expand(self):
+        time_factor = 2  # Adjust this factor to slow down expansion
+        if self.enemy_race == Race.Protoss and self.iteration > 600:
+            time_factor = 4
         try:
             if self.already_pending(UnitTypeId.NEXUS) > 0.3:
                 if self.townhalls.not_ready.first.health_percentage < 0.1:
                     self.townhalls.not_ready.first(AbilityId.CANCEL_BUILDINPROGRESS)
-            if self.townhalls.ready.amount + 2 < (self.iteration / self.ITERATIONS_PER_MINUTE) * 2 and self.can_afford(
+            if self.townhalls.ready.amount + 2 < (self.iteration / self.ITERATIONS_PER_MINUTE) * time_factor and self.can_afford(
                     UnitTypeId.NEXUS) and self.townhalls.ready.amount < 15 and not self.already_pending(UnitTypeId.NEXUS) > 0 and \
-                    (self.iteration - self.expand_time) > 400:
+                    (self.iteration - self.expand_time) > 200:
                 await self.expand_now()
                 self.expand_time = self.iteration
         except:
@@ -1974,7 +2302,8 @@ class RaidenBot(BotAI):
                                 (self.enemy_race == Race.Terran and
                                  self.structures.of_type({UnitTypeId.GATEWAY, UnitTypeId.WARPGATE}).amount < (self.townhalls.ready.amount + 2) and
                                  self.iteration > 800):
-                            if self.can_afford(UnitTypeId.GATEWAY) and not self.already_pending(UnitTypeId.GATEWAY) > 0:
+                            if self.can_afford(UnitTypeId.GATEWAY) and (not self.already_pending(UnitTypeId.GATEWAY) > 0 or
+                                                                        (self.can_afford(UnitTypeId.NEXUS) and not self.already_pending(UnitTypeId.GATEWAY) > 2)):
                                 await self.build(UnitTypeId.GATEWAY, near=pylon)
                         elif self.structures.of_type({UnitTypeId.GATEWAY, UnitTypeId.WARPGATE}).ready.amount < 1 and not self.enemy_race == Race.Zerg and \
                                 not (self.enemy_race == Race.Terran and self.iteration < 400):
@@ -1995,6 +2324,9 @@ class RaidenBot(BotAI):
     async def build_offensive_force(self):
         try:
             if self.armyComp == ArmyComp.AIR:
+                if self.structures(UnitTypeId.FLEETBEACON).ready.exists and self.can_afford(UpgradeId.VOIDRAYSPEEDUPGRADE)and self.already_pending_upgrade(
+                        UpgradeId.VOIDRAYSPEEDUPGRADE) == 0 and self.structures(UnitTypeId.FLEETBEACON).ready.first.is_powered:
+                    self.research(UpgradeId.VOIDRAYSPEEDUPGRADE)
                 for sg in self.structures(UnitTypeId.STARGATE).ready.idle:
                     if self.can_afford(UnitTypeId.VOIDRAY) and sg.is_powered and self.supply_left > 0:
                         if self.iteration > 2500 and not self.units(UnitTypeId.ORACLE).exists and \
@@ -2223,13 +2555,23 @@ class RaidenBot(BotAI):
                            UnitTypeId.DARKTEMPLAR,
                            UnitTypeId.SENTRY,
                            UnitTypeId.MARAUDER,
-                           UnitTypeId.MARINE}
+                           UnitTypeId.MARINE,
+                           UnitTypeId.BATTLECRUISER,
+                           UnitTypeId.WIDOWMINE,
+                           UnitTypeId.HELLION,
+                           UnitTypeId.HELLIONTANK,
+                           UnitTypeId.AUTOTURRET}
+
+        for probe in self.units(UnitTypeId.PROBE):
+            if probe.has_buff(BuffId.CARRYHARVESTABLEVESPENEGEYSERGASPROTOSS) or probe.has_buff(BuffId.CARRYHARVESTABLEVESPENEGEYSERGAS):
+                if probe.tag not in self.probe_assigned_to_gas:
+                    self.probe_assigned_to_gas.add(probe.tag)
         if self.rushDetected is True:
             if self.enemy_units.of_type({UnitTypeId.ZERGLING, UnitTypeId.ROACH}).exists:
                 for probe in self.units(UnitTypeId.PROBE).ready:
                     if probe.distance_to(self.start_location) > 9:
                         enemy_units = self.enemy_units.of_type({UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.ROACH, UnitTypeId.LURKER}).closer_than(5, probe)
-                        if enemy_units and not probe.is_attacking:
+                        if enemy_units and not probe.is_attacking and (self.iteration - self.lastAttack) > 80:
                             probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
         if self.enemy_units.of_type(offensive_units).exists:
             for probe in self.units(UnitTypeId.PROBE).ready:
@@ -2237,6 +2579,15 @@ class RaidenBot(BotAI):
                     enemy_units = self.enemy_units.of_type(offensive_units).closer_than(4, probe)
                     if enemy_units and not probe.is_attacking:
                         probe(AbilityId.SMART, self.mineral_field.closest_to(self.start_location))
+                else:
+                    enemy_units = self.enemy_units.of_type(offensive_units).closer_than(4, probe)
+                    if enemy_units and not probe.is_attacking:
+                        grid: np.ndarray = self.pathing.ground_grid
+                        probe.move(
+                            self.pathing.find_path_next_point(
+                                probe.position, self.mineral_field.closest_to(self.main_base_ramp.bottom_center).position, grid
+                            )
+                        )
 
         for nexus in self.townhalls.ready:
             if (self.iteration - self.lastAttack) > 80 and not self.enemy_units.closer_than(10, nexus).amount > 0:
@@ -2252,36 +2603,32 @@ class RaidenBot(BotAI):
                 self.lastAttack = self.iteration
                 self.attacked_nexus = nexus.tag
                 for probe in self.units(UnitTypeId.PROBE).closer_than(7, nexus):
-                    try:
-                        if self.enemy_units.exists:
-                            probe.attack(self.enemy_units.closest_to(nexus).position)
-                            break
-                    except:
-                        return
+                    closest_enemy = self.enemy_units.closer_than(10, nexus)
+                    if closest_enemy:
+                        probe.attack(closest_enemy.closest_to(nexus).position)
+                break
             elif nexus.distance_to(self.start_location) < 4 \
                     and (self.iteration - self.lastAttack) > 50 and \
                     self.enemy_units.of_type(offensive_units).exists and \
-                    self.enemy_units.of_type(offensive_units).closer_than(8, nexus) and \
-                    0 < self.enemy_units.closer_than(8, nexus).of_type(offensive_units).amount < 5:
+                    0 < self.enemy_units.of_type(offensive_units).closer_than(8, nexus).amount < 6:
                 self.lastAttack = self.iteration
                 self.attacked_nexus = nexus.tag
                 for probe in self.units(UnitTypeId.PROBE).closer_than(7, nexus):
-                    try:
-                        if self.enemy_units.exists:
-                            probe.attack(self.enemy_units.closest_to(nexus).position)
-                            break
-                    except:
-                        return
+                    if probe.tag not in self.probe_assigned_to_gas:
+                        closest_enemy = self.enemy_units.closer_than(8, nexus)
+                        if closest_enemy:
+                            probe.attack(closest_enemy.closest_to(nexus).position)
+                break
             elif self.iteration < 2000 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.exists and (
                     6 < self.enemy_units.closer_than(10, nexus).of_type({UnitTypeId.DRONE,
                                                                          UnitTypeId.PROBE,
                                                                          UnitTypeId.SCV}).amount or (
-                            0 < self.enemy_units.closer_than(10, nexus).of_type(offensive_units).amount < 8 and
-                            0 < self.enemy_units.closer_than(7, nexus).of_type(offensive_units).amount)):
+                            0 < self.enemy_units.of_type(offensive_units).closer_than(10, nexus).amount < 8 and
+                            0 < self.enemy_units.of_type(offensive_units).closer_than(7, nexus).amount)):
                 self.lastAttack = self.iteration
                 self.attacked_nexus = nexus.tag
                 total_probes = self.units(UnitTypeId.PROBE).ready.amount
-                num_enemies = self.enemy_units.closer_than(9, nexus).amount
+                num_enemies = self.enemy_units.closer_than(10, nexus).amount
                 max_probes_to_select = min(total_probes, num_enemies * 6)
                 for i in range(max_probes_to_select):
                     probe = self.units(UnitTypeId.PROBE).ready[i]
@@ -2289,25 +2636,22 @@ class RaidenBot(BotAI):
                         probe.attack(self.enemy_units.closest_to(nexus).position)
                 break
             elif self.iteration < 2000 and (self.iteration - self.lastAttack) > 50 and self.enemy_units.exists and \
-                    self.enemy_units.closer_than(10, nexus).amount > 7:
+                    self.enemy_units.of_type(offensive_units).closer_than(10, nexus).amount > 7:
                 self.lastAttack = self.iteration
                 if not self.attacked_nexus or nexus.tag == self.attacked_nexus:
                     self.attacked_nexus = None
                     for probe in self.units(UnitTypeId.PROBE).closer_than(10, nexus):
-                        try:
-                            if self.townhalls.ready.exists and probe.distance_to(self.start_location) > 9:
-                                probe.move(self.townhalls.closest_to(self.start_location).position)
-                                probe(AbilityId.SMART, self.mineral_field.closest_to(self.townhalls.closest_to(self.start_location)), True)
-                                break
-                        except:
-                            return
+                        if self.townhalls.ready.exists and probe.distance_to(self.start_location) > 9:
+                            probe.move(self.townhalls.closest_to(self.start_location).position)
+                            probe(AbilityId.SMART, self.mineral_field.closest_to(self.townhalls.closest_to(self.start_location)), True)
+                    break
 
     async def get_next_exp(self):
         self.next_exp = await self.get_next_expansion()
 
     async def idle_defense_behavior(self):
         if self.iteration < self.do_something_after:
-            if self.burrow_detected:
+            if self.burrow_detected or (self.enemy_units.exists and self.enemy_units.closer_than(30, self.start_location)):
                 for oracle in self.units.of_type({UnitTypeId.ORACLE}).idle:
                     if self.enemy_units.exists:
                         for enemy_unit in self.enemy_units:
@@ -2323,21 +2667,46 @@ class RaidenBot(BotAI):
                     if (self.iteration - self.last_check) > 100 and self.next_exp and oracle.energy_percentage > 0.4 and \
                             (100 < (self.iteration - self.expand_time) < 400 and not self.already_pending(UnitTypeId.NEXUS) > 0) and \
                             AbilityId.ORACLEREVELATION_ORACLEREVELATION in self.availableUnitsAbilities.get(oracle.tag, set()):
-                        self.last_check = self.iteration
-                        oracle(AbilityId.ORACLEREVELATION_ORACLEREVELATION, self.next_exp)
+                        if self.enemy_units.exists and self.enemy_units.closer_than(30, self.start_location):
+                            for enemy in self.enemy_units.closer_than(30, self.start_location):
+                                if not enemy.is_flying and enemy.is_visible:
+                                    if oracle.tag in self.availableUnitsAbilities.keys():
+                                        if AbilityId.BEHAVIOR_PULSARBEAMON in self.availableUnitsAbilities.get(oracle.tag, set()):
+                                            oracle(AbilityId.BEHAVIOR_PULSARBEAMON)
+                                            oracle.smart(enemy, True)
+                                    else:
+                                        if AbilityId.BEHAVIOR_PULSARBEAMOFF in self.availableUnitsAbilities.get(oracle.tag, set()):
+                                            oracle(AbilityId.BEHAVIOR_PULSARBEAMOFF)
+                            self.last_check = self.iteration
+                        else:
+                            self.last_check = self.iteration
+                            oracle(AbilityId.ORACLEREVELATION_ORACLEREVELATION, self.next_exp)
             if (self.iteration - self.lastAttack) > 40:
                 for unit in self.units.of_type({UnitTypeId.STALKER, UnitTypeId.VOIDRAY, UnitTypeId.SENTRY, UnitTypeId.IMMORTAL, UnitTypeId.ZEALOT}).idle:
-                    if self.enemy_units.exists:
+                    if self.enemy_units.exists and unit.distance_to(self.enemy_main_base_ramp.top_center) > 20:
                         first = None
-                        for nexus in self.townhalls:
+                        for nexus in self.townhalls.ready:
+                            enemy_structures = self.enemy_structures.closer_than(40, self.start_location)
                             enemy_targets = self.enemy_units.closer_than(15, nexus) \
                                 .filter(lambda e: e.type_id != UnitTypeId.OVERLORD and e.type_id != UnitTypeId.OVERSEER)
                             if enemy_targets.amount > 0:
                                 for enemy_unit in enemy_targets:
+                                    if enemy_unit.is_visible:
+                                        if not first:
+                                            unit.attack(enemy_unit.position)
+                                            first = enemy_unit
+                                        else:
+                                            unit.attack(enemy_unit.position, True)
+                                self.lastAttack = self.iteration
+                            elif enemy_structures.amount > 0:
+                                for enemy_structure in enemy_structures:
                                     if not first:
-                                        unit.attack(enemy_unit.position)
+                                        unit.attack(enemy_structure.position)
+                                        first = enemy_structure
                                     else:
-                                        unit.attack(enemy_unit.position, True)
+                                        unit.attack(enemy_structure.position, True)
+                                self.lastAttack = self.iteration
+
             if self.enemy_race == Race.Zerg and self.townhalls.amount > 1 and \
                     self.iteration < self.do_something_after and (self.iteration - self.last_check) > 100 and \
                     (100 < (self.iteration - self.expand_time) < 400 and not self.already_pending(UnitTypeId.NEXUS) > 0):
@@ -2372,16 +2741,16 @@ class RaidenBot(BotAI):
                        3: "Attack Enemy Start !",
                        4: "Attack specific target in vision !"}
         attackedNexus = None
-        build_choices_made = 0
         if self.iteration < 100:
             return
         # Choices for build orders (can change only after 3000 iterations)
         if not self.armyComp or (self.iteration - self.lastBuildChoice) > 3000:
-            if self.selected_strategy_sequence and build_choices_made < 3:
+            if self.selected_strategy_sequence and self.build_choices_made < 3:
                 self.lastBuildChoice = self.iteration
-                self.armyComp = ArmyComp.GROUND if self.selected_strategy_sequence[build_choices_made] == ArmyComp.GROUND.value else ArmyComp.AIR
+                self.armyComp = ArmyComp.GROUND if self.selected_strategy_sequence[self.build_choices_made] == ArmyComp.GROUND.value else ArmyComp.AIR
                 self.mainUnit = UnitTypeId.STALKER if self.armyComp == ArmyComp.GROUND else UnitTypeId.VOIDRAY
-                build_choices_made += 1
+                logger.info("Build Choice #{}:{} ArmyComp: {}".format(self.build_choices_made, self.selected_strategy_sequence[self.build_choices_made], self.armyComp))
+                self.build_choices_made += 1
             else:
                 self.lastBuildChoice = self.iteration
                 buildChoice = random.randrange(0, 2)
@@ -2394,7 +2763,31 @@ class RaidenBot(BotAI):
             self.mainUnit = UnitTypeId.STALKER
         else:
             self.mainUnit = UnitTypeId.VOIDRAY
+        if (self.iteration - self.last_micro_management) > 4:
+            for u in self.units.of_type({UnitTypeId.IMMORTAL,
+                                         UnitTypeId.STALKER,
+                                         UnitTypeId.SENTRY,
+                                         UnitTypeId.ARCHON,
+                                         UnitTypeId.HIGHTEMPLAR,
+                                         UnitTypeId.ZEALOT,
+                                         UnitTypeId.COLOSSUS}).ready:
+                if not u.is_idle and u.order_target is not None and u.tag in self.current_target:
+                    self.last_micro_management = self.iteration
+                    await self.handle_attacking_unit_safety(u, self.current_target[u.tag])
+            for voidray in self.units(UnitTypeId.VOIDRAY).ready:
+                if voidray.tag not in self.no_kiting_delay_map:
+                    self.no_kiting_delay_map[voidray.tag] = 0
+                if not voidray.is_idle and voidray.order_target is not None and voidray.tag in self.current_target and \
+                        (self.iteration - self.no_kiting_delay_map[voidray.tag]) > 20:
+                    self.last_micro_management = self.iteration
+                    enemy_units = self.enemy_units.of_type(AA_ENEMY_UNITS).closer_than(9, voidray)
+                    if enemy_units and voidray.shield_percentage < 0.5:
+                        voidray.move(self.calculateDodgeDest(voidray, enemy_units.closest_to(voidray)))
+                        if voidray.shield_percentage > 0.1:
+                            voidray.attack(self.current_target[voidray.tag], True)
+                            self.no_kiting_delay_map[voidray.tag] = self.iteration
         if self.units.of_type({UnitTypeId.STALKER, UnitTypeId.VOIDRAY}).idle.amount > 0 and self.units(UnitTypeId.IMMORTAL).idle.amount >= 0:
+            target = None
             if self.iteration > self.do_something_after:
                 for nexus in self.townhalls.ready:
                     if nexus.shield_percentage < 0.6 and self.enemy_units.closer_than(8, nexus):
@@ -2409,8 +2802,6 @@ class RaidenBot(BotAI):
                     logger.info("Choice #{}:{}".format(choice, choice_dict[choice]))
                 else:
                     choice = random.randrange(0, 5)
-
-                target = False
                 logger.info(f"Resolved Choice #{choice}:{choice_dict[choice]}")
                 if choice == 0:
                     # no attack
@@ -2429,7 +2820,7 @@ class RaidenBot(BotAI):
                         elif self.enemy_units.amount > 0:
                             for nexus in self.townhalls.ready:
                                 if self.enemy_units.closer_than(15, nexus):
-                                    target = self.enemy_units.closest_to(self.structures(UnitTypeId.NEXUS).random).position
+                                    target = self.enemy_units.closest_to(nexus).position
                         else:
                             self.manageArmy()
                     except:
@@ -2439,14 +2830,17 @@ class RaidenBot(BotAI):
                     # attack enemy structures
                     if len(self.enemy_structures) > 0:
                         target = random.choice(self.enemy_structures).position
+                        self.do_something_after = self.iteration + 70
 
                 elif choice == 3:
                     # attack_enemy_start
                     target = self.enemy_start_locations[0].position
+                    self.do_something_after = self.iteration + 70
 
                 elif choice == 4:
                     self.harass()
                     target = self.find_target()  # possibility to pass state
+                    self.do_something_after = self.iteration + 70
                 if target:
                     leader = self.units.find_by_tag(self.squadLeaderTag)
                     units_close_to_leader = self.units(self.mainUnit).idle
@@ -2477,6 +2871,7 @@ class RaidenBot(BotAI):
                                                      self.units(UnitTypeId.ZEALOT).idle,
                                                      self.units(UnitTypeId.COLOSSUS).idle]))):
                         u.attack(target.position, True)
+                        self.current_target[u.tag] = target.position
                 y = np.zeros(5)
                 y[choice] = 1
                 self.train_data.append([y, self.flipped])
@@ -2489,7 +2884,7 @@ def main():
                 GameMatch(
                     maps.get("GresvanAIE"), [
                         Bot(Race.Protoss, RaidenBot()),
-                        Computer(Race.Terran, Difficulty.Harder, ai_build=AIBuild.Rush)], realtime=True),
+                        Computer(Race.Protoss, Difficulty.Harder, ai_build=AIBuild.Rush)], realtime=True),
                 GameMatch(
                     maps.get("StargazersAIE"), [
                         Bot(Race.Protoss, RaidenBot()),
