@@ -1,5 +1,7 @@
 # Starcraft II Machine Learning Bot
 
+AI arena Bot page : [sc2-raiden-bot](https://aiarena.net/bots/601/)
+
 Welcome to the repository for my Starcraft II Machine Learning (ML) bot, developed for competing in a Starcraft II bot ladder competition. This bot is designed using Python and leverages various libraries and frameworks to train and deploy an AI agent capable of playing Starcraft II autonomously.
 
 ## Table of Contents
